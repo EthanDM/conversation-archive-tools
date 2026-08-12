@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conversation-archive-tools"
+version = "0.1.0"
+description = "Local-first indexing, search, and review tools for AI conversation archives."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Ethan Millstein" }]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+conversation-archive-configure = "conversation_archive.entrypoints:configure"
+conversation-archive-audit = "conversation_archive.entrypoints:audit_chatgpt"
+conversation-archive-handoff = "conversation_archive.entrypoints:handoff_chatgpt"
+conversation-archive-index-chatgpt = "conversation_archive.entrypoints:index_chatgpt"
+conversation-archive-search-chatgpt = "conversation_archive.entrypoints:search_chatgpt"
+conversation-archive-show-chatgpt = "conversation_archive.entrypoints:show_chatgpt"
+conversation-archive-refresh-chatgpt = "conversation_archive.entrypoints:refresh_chatgpt"
+conversation-archive-index-codex = "conversation_archive.entrypoints:index_codex"
+conversation-archive-search-codex = "conversation_archive.entrypoints:search_codex"
+conversation-archive-show-codex = "conversation_archive.entrypoints:show_codex"
+conversation-archive-context-candidates = "conversation_archive.entrypoints:context_candidates"
+conversation-archive-index-historical = "conversation_archive.entrypoints:index_historical"
+conversation-archive-search-historical = "conversation_archive.entrypoints:search_historical"
+conversation-archive-build-reflection-indexes = "conversation_archive.entrypoints:build_reflection_indexes"
+conversation-archive-serve = "conversation_archive.entrypoints:serve"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["conversation_archive*"]

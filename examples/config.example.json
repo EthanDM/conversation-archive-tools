@@ -1,0 +1,6 @@
+{
+  "archive_root": "/path/to/ChatGPT Archive",
+  "current_export": "YYYY-MM-DD",
+  "runtime_db": "/path/to/local/current.sqlite",
+  "historical_db": "/path/to/local/historical.sqlite"
+}

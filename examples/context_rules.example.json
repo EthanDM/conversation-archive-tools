@@ -1,0 +1,16 @@
+{
+  "rules": [
+    {
+      "key": "collaboration",
+      "proposed_text": "Prefer direct, evidence-backed answers that distinguish confirmed facts from inference.",
+      "pattern": "\\b(direct|evidence[- ]backed|confirmed facts|inference)\\b",
+      "overlap_query": "\"evidence-backed\" OR \"confirmed facts\""
+    }
+  ],
+  "sensitive_patterns": {
+    "health": "\\b(health|doctor|symptom|diet)\\b",
+    "relationships": "\\b(dating|relationship|family)\\b",
+    "finance_legal": "\\b(finance|tax|legal)\\b",
+    "political_personal": "\\b(political|election|campaign)\\b"
+  }
+}

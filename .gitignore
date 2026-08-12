@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite.building
+output/
+knowledge_base/
+transcripts/
+*.md.tmp
+.env
+build/
+*.egg-info/

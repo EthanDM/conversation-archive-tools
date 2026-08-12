@@ -1,0 +1,29 @@
+[
+  {
+    "conversation_id": "fixture-conversation",
+    "title": "Fixture planning conversation",
+    "create_time": 1704067200,
+    "update_time": 1704067260,
+    "current_node": "assistant-node",
+    "mapping": {
+      "user-node": {
+        "parent": null,
+        "message": {
+          "id": "fixture-user-message",
+          "create_time": 1704067200,
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["I want a local archive for project planning."]}
+        }
+      },
+      "assistant-node": {
+        "parent": "user-node",
+        "message": {
+          "id": "fixture-assistant-message",
+          "create_time": 1704067260,
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["A SQLite FTS index is a good fit."]}
+        }
+      }
+    }
+  }
+]
