@@ -255,6 +255,11 @@ def index_sessions(
     files replace prior rows for either their path or their session ID. ``reset``
     removes only the target SQLite database and its WAL sidecars.
     """
+    input_path = input_path.expanduser()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Codex session input does not exist: {input_path}")
+    if not input_path.is_file() and not input_path.is_dir():
+        raise ValueError(f"Codex session input is not a file or directory: {input_path}")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if reset:
         for suffix in ("", "-wal", "-shm"):

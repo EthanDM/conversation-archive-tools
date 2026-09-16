@@ -16,6 +16,7 @@ sys.path.insert(0, str(SOURCE_DIR))
 from conversation_archive.chatgpt.audit import audit_export
 from conversation_archive.chatgpt.handoff import export_handoff
 from conversation_archive.chatgpt.index import index_export
+from conversation_archive.chatgpt.refresh import validate_database
 from conversation_archive.chatgpt.search import search
 
 
@@ -40,6 +41,20 @@ class ChatGPTExportIndexTests(unittest.TestCase):
             with sqlite3.connect(db_path) as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM conversations").fetchone()[0], 1)
                 self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 2)
+            self.assertEqual(validate_database(db_path), (1, 2))
+
+            index_export(
+                FIXTURE_EXPORT,
+                db_path,
+                include_hidden=False,
+                write_markdown_dir=None,
+                limit=None,
+                progress_every=0,
+                reset=False,
+                all_nodes=False,
+                incremental=False,
+            )
+            self.assertEqual(validate_database(db_path), (1, 2))
 
             output = io.StringIO()
             with redirect_stdout(output):
@@ -81,6 +96,31 @@ class ChatGPTExportIndexTests(unittest.TestCase):
             index_export(root, db_path, include_hidden=False, write_markdown_dir=None, limit=None, progress_every=0, reset=True, all_nodes=False, incremental=False)
             with sqlite3.connect(db_path) as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM conversations").fetchone()[0], 1)
+
+    def test_rebuilds_a_legacy_external_content_fts_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "export.sqlite"
+            index_export(FIXTURE_EXPORT, db_path, include_hidden=False, write_markdown_dir=None, limit=None, progress_every=0, reset=True, all_nodes=False, incremental=False)
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    DROP TRIGGER messages_ai;
+                    DROP TRIGGER messages_ad;
+                    DROP TRIGGER messages_au;
+                    DROP TABLE messages_fts;
+                    CREATE VIRTUAL TABLE messages_fts USING fts5(
+                      text,
+                      conversation_id UNINDEXED,
+                      title,
+                      role UNINDEXED,
+                      create_time_iso UNINDEXED,
+                      content='messages',
+                      content_rowid='id'
+                    );
+                    """
+                )
+            index_export(FIXTURE_EXPORT, db_path, include_hidden=False, write_markdown_dir=None, limit=0, progress_every=0, reset=False, all_nodes=False, incremental=True)
+            self.assertEqual(validate_database(db_path), (1, 2))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,105 @@
+"""Publish one Mac's Codex session JSONL files into a shared private archive."""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import os
+import shutil
+import sys
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+from .paths import (
+    default_input_path,
+    default_machine_id,
+    default_shared_input_path,
+    validate_machine_id,
+)
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    copied: int
+    skipped: int
+    destination: Path
+
+
+def iter_session_files(input_path: Path) -> list[tuple[Path, Path]]:
+    if input_path.is_file():
+        if input_path.suffix != ".jsonl":
+            return []
+        return [(input_path, Path(input_path.name))]
+    return [
+        (path, path.relative_to(input_path))
+        for path in sorted(input_path.rglob("*.jsonl"))
+        if path.is_file()
+    ]
+
+
+def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> PublishResult:
+    machine_id = validate_machine_id(machine_id)
+    source_root = input_path.expanduser().resolve()
+    archive_root = archive_root.expanduser().resolve()
+    destination_root = archive_root / machine_id
+
+    if source_root == destination_root or source_root.is_relative_to(destination_root):
+        raise ValueError("Codex session input must not be inside its archive destination.")
+    if destination_root.is_relative_to(source_root):
+        raise ValueError("Codex session archive destination must not be inside its input directory.")
+    if not source_root.exists():
+        raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
+
+    copied = skipped = 0
+    for source, relative_path in iter_session_files(source_root):
+        destination = destination_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() and filecmp.cmp(source, destination, shallow=False):
+            skipped += 1
+            continue
+
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        copied += 1
+
+    return PublishResult(copied=copied, skipped=skipped, destination=destination_root)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Publish one Mac's Codex session JSONL files to its private archive namespace."
+    )
+    parser.add_argument("--input", default=default_input_path(), help="Local Codex sessions directory or one JSONL session")
+    parser.add_argument(
+        "--archive-root",
+        help="Shared Codex-session archive root; defaults to the configured ChatGPT Archive/codex-sessions",
+    )
+    parser.add_argument(
+        "--machine-id",
+        default=default_machine_id(),
+        required=default_machine_id() is None,
+        help="Stable lowercase ID for this Mac",
+    )
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    archive_root = (
+        Path(args.archive_root).expanduser()
+        if args.archive_root
+        else Path(default_shared_input_path()).expanduser()
+    )
+    result = publish_sessions(Path(args.input).expanduser(), archive_root, args.machine_id)
+    print(f"done: copied {result.copied} sessions, skipped {result.skipped} unchanged sessions")
+    print(f"shared archive: {result.destination}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

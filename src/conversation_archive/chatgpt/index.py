@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .paths import default_db_path, default_export_path
 
-INDEXER_VERSION = "4"
+INDEXER_VERSION = "5"
 INDEX_MODE_ALL_NODES = "all_nodes"
 INDEX_MODE_CURRENT_PATH_ONLY = "current_path_only"
 SHARDED_EXPORT_GLOB = "conversations-*.json"
@@ -401,8 +401,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   title,
   role UNINDEXED,
   create_time_iso UNINDEXED,
-  content='messages',
-  content_rowid='id',
   tokenize = 'unicode61 remove_diacritics 2'
 );
 
@@ -419,11 +417,11 @@ CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  DELETE FROM messages_fts WHERE rowid=old.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  DELETE FROM messages_fts WHERE rowid=old.id;
   INSERT INTO messages_fts(rowid, text, conversation_id, title, role, create_time_iso)
   VALUES (
     new.id,
@@ -440,7 +438,28 @@ END;
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=ON;")
+    fts_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+    ).fetchone()
+    if fts_row and "content='messages'" in (fts_row[0] or ""):
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS messages_ai;
+            DROP TRIGGER IF EXISTS messages_ad;
+            DROP TRIGGER IF EXISTS messages_au;
+            DROP TABLE messages_fts;
+            """
+        )
     conn.executescript(SCHEMA_SQL)
+    if fts_row and "content='messages'" in (fts_row[0] or ""):
+        conn.execute(
+            """
+            INSERT INTO messages_fts(rowid, text, conversation_id, title, role, create_time_iso)
+            SELECT m.id, m.text, m.conversation_id, c.title, m.role, m.create_time_iso
+            FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id
+            """
+        )
+        conn.commit()
     return conn
 
 

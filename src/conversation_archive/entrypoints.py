@@ -14,6 +14,7 @@ from .chatgpt.search import main as search_chatgpt_main
 from .chatgpt.show import main as show_chatgpt_main
 from .codex.context_candidates import main as context_candidates_main
 from .codex.index import main as index_codex_main
+from .codex.publish import main as publish_codex_main
 from .codex.search import main as search_codex_main
 from .codex.show import main as show_codex_main
 from .chatgpt.reflection_indexes import main as build_reflection_indexes_main
@@ -54,6 +55,10 @@ def refresh_chatgpt() -> int:
 
 def index_codex() -> int:
     return _run(index_codex_main)
+
+
+def publish_codex() -> int:
+    return _run(publish_codex_main)
 
 
 def search_codex() -> int:
