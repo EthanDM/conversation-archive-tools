@@ -66,14 +66,21 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
     for source, relative_path in iter_session_files(source_root):
         destination = destination_root / relative_path
         ensure_destination_parent(archive_root, destination)
-        if destination.exists() and filecmp.cmp(source, destination, shallow=False):
+        if destination.is_symlink():
+            raise ValueError(f"Codex session archive destination is a symlink: {destination}")
+        source_mode = source.stat().st_mode & 0o777
+        if (
+            destination.exists()
+            and destination.stat().st_mode & 0o777 == source_mode
+            and filecmp.cmp(source, destination, shallow=False)
+        ):
             skipped += 1
             continue
 
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
         try:
             shutil.copyfile(source, temporary)
-            temporary.chmod(source.stat().st_mode & 0o777)
+            temporary.chmod(source_mode)
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)

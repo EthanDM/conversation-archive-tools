@@ -241,6 +241,57 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def scope_index_to_input(cursor: sqlite3.Cursor, input_path: Path) -> None:
+    """Remove rows that do not belong to the requested input file or directory."""
+    out_of_scope = [
+        (source_path,)
+        for (source_path,) in cursor.execute("SELECT source_path FROM sessions")
+        if (
+            Path(source_path) != input_path
+            if input_path.is_file()
+            else not Path(source_path).is_relative_to(input_path)
+        )
+    ]
+    cursor.executemany("DELETE FROM sessions WHERE source_path=?", out_of_scope)
+
+
+def replace_session(
+    cursor: sqlite3.Cursor, parsed: ParsedSession, source_path: str, stat: object
+) -> int:
+    """Replace either identity with one parsed session and return its message count."""
+    cursor.execute("DELETE FROM sessions WHERE source_path=? OR session_id=?", (source_path, parsed.session_id))
+    user_count = sum(message.role == "user" for message in parsed.messages)
+    assistant_count = sum(message.role == "assistant" for message in parsed.messages)
+    cursor.execute(
+        """
+        INSERT INTO sessions(
+          session_id, source_path, cwd, title, first_time_iso, last_time_iso,
+          file_size, file_mtime_ns, user_message_count, assistant_message_count
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            parsed.session_id,
+            source_path,
+            parsed.cwd,
+            parsed.title,
+            parsed.first_time_iso,
+            parsed.last_time_iso,
+            stat.st_size,
+            stat.st_mtime_ns,
+            user_count,
+            assistant_count,
+        ),
+    )
+    cursor.executemany(
+        "INSERT INTO messages(session_id, seq, role, create_time_iso, text) VALUES (?,?,?,?,?)",
+        [
+            (parsed.session_id, sequence, message.role, message.create_time_iso, message.text)
+            for sequence, message in enumerate(parsed.messages, start=1)
+        ],
+    )
+    return len(parsed.messages)
+
+
 def index_sessions(
     input_path: Path,
     db_path: Path,
@@ -255,7 +306,7 @@ def index_sessions(
     files replace prior rows for either their path or their session ID. ``reset``
     removes only the target SQLite database and its WAL sidecars.
     """
-    input_path = input_path.expanduser()
+    input_path = input_path.expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {input_path}")
     if not input_path.is_file() and not input_path.is_dir():
@@ -266,23 +317,28 @@ def index_sessions(
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
     connection = connect(db_path)
     cursor = connection.cursor()
+    scope_index_to_input(cursor, input_path)
     indexed = skipped = retained_messages = 0
+    paths = list(iter_session_files(input_path))
+    displaced_session_ids: set[str] = set()
 
-    for path in iter_session_files(input_path):
+    for path in paths:
         if limit is not None and indexed + skipped >= limit:
             break
         stat = path.stat()
         source_path = str(path.resolve())
         existing = cursor.execute(
-            "SELECT file_size, file_mtime_ns FROM sessions WHERE source_path=?", (source_path,)
+            "SELECT session_id, file_size, file_mtime_ns FROM sessions WHERE source_path=?", (source_path,)
         ).fetchone()
         if incremental and existing:
-            if existing[0] == stat.st_size and existing[1] == stat.st_mtime_ns:
+            if existing[1] == stat.st_size and existing[2] == stat.st_mtime_ns:
                 skipped += 1
                 continue
         parsed = parse_session_file(path)
         if parsed is None:
             continue
+        if existing and existing[0] != parsed.session_id:
+            displaced_session_ids.add(existing[0])
         # Remove any prior session that occupied this path before deciding whether
         # another, newer path should retain this parsed session ID.
         cursor.execute("DELETE FROM sessions WHERE source_path=?", (source_path,))
@@ -297,39 +353,20 @@ def index_sessions(
         ):
             skipped += 1
             continue
-        # A session can move paths after a restore; retain only this current identity.
-        cursor.execute("DELETE FROM sessions WHERE session_id=?", (parsed.session_id,))
-        user_count = sum(message.role == "user" for message in parsed.messages)
-        assistant_count = sum(message.role == "assistant" for message in parsed.messages)
-        cursor.execute(
-            """
-            INSERT INTO sessions(
-              session_id, source_path, cwd, title, first_time_iso, last_time_iso,
-              file_size, file_mtime_ns, user_message_count, assistant_message_count
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                parsed.session_id,
-                source_path,
-                parsed.cwd,
-                parsed.title,
-                parsed.first_time_iso,
-                parsed.last_time_iso,
-                stat.st_size,
-                stat.st_mtime_ns,
-                user_count,
-                assistant_count,
-            ),
-        )
-        cursor.executemany(
-            "INSERT INTO messages(session_id, seq, role, create_time_iso, text) VALUES (?,?,?,?,?)",
-            [
-                (parsed.session_id, sequence, message.role, message.create_time_iso, message.text)
-                for sequence, message in enumerate(parsed.messages, start=1)
-            ],
-        )
+        retained_messages += replace_session(cursor, parsed, source_path, stat)
         indexed += 1
-        retained_messages += len(parsed.messages)
+
+    for session_id in displaced_session_ids:
+        candidates = [
+            (path, parsed)
+            for path in paths
+            if (parsed := parse_session_file(path)) is not None and parsed.session_id == session_id
+        ]
+        if not candidates:
+            continue
+        path, parsed = max(candidates, key=lambda candidate: candidate[0].stat().st_mtime_ns)
+        retained_messages += replace_session(cursor, parsed, str(path.resolve()), path.stat())
+        indexed += 1
 
     cursor.execute(
         "INSERT INTO index_meta(key, value) VALUES('indexer_version', ?) "

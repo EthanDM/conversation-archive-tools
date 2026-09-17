@@ -195,6 +195,31 @@ class CodexSessionIndexTests(unittest.TestCase):
             destination = result.destination / source.name
             self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
+    def test_publisher_updates_permission_only_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions)
+            archive = root / "archive"
+            publish_sessions(sessions, archive, "desktop")
+            source.chmod(0o600)
+            result = publish_sessions(sessions, archive, "desktop")
+            destination = result.destination / source.name
+            self.assertEqual((result.copied, result.skipped), (1, 0))
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+
+    def test_publisher_rejects_a_symlinked_destination_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions)
+            archive = root / "archive"
+            destination = archive / "desktop" / source.name
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(source)
+            with self.assertRaisesRegex(ValueError, "destination is a symlink"):
+                publish_sessions(sessions, archive, "desktop")
+
     def test_shared_index_prefers_the_newest_duplicate_session_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -255,6 +280,24 @@ class CodexSessionIndexTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
                 self.assertEqual(connection.execute("SELECT session_id FROM sessions").fetchone()[0], "session-2")
 
+    def test_changed_duplicate_winner_restores_the_previous_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            older = self.write_fixture(root / "sessions", "a.jsonl")
+            newer = self.write_fixture(root / "sessions", "z.jsonl")
+            os.utime(newer, ns=(newer.stat().st_atime_ns, newer.stat().st_mtime_ns + 1))
+            db = root / "index.sqlite"
+            index_sessions(root / "sessions", db)
+
+            newer.write_text(newer.read_text(encoding="utf-8").replace('"session-1"', '"session-2"'), encoding="utf-8")
+            index_sessions(root / "sessions", db)
+
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(
+                    {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
+                    {"session-1", "session-2"},
+                )
+
     def test_shared_index_rejects_explicit_input(self) -> None:
         with self.assertRaises(SystemExit):
             codex_index.main(["--shared", "--input", "sessions"])
@@ -271,6 +314,26 @@ class CodexSessionIndexTests(unittest.TestCase):
             ):
                 self.assertEqual(codex_index.main(["--shared", "--db", str(db)]), 0)
             self.assertTrue(db.exists())
+
+    def test_shared_index_removes_rows_from_a_prior_local_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local = self.write_fixture(root / "local")
+            shared = self.write_fixture(root / "shared" / "desktop")
+            shared.write_text(shared.read_text(encoding="utf-8").replace('"session-1"', '"shared-session"'), encoding="utf-8")
+            db = root / "index.sqlite"
+            index_sessions(local.parent, db)
+            with patch.dict(
+                "os.environ",
+                {"CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT": str(root / "shared")},
+                clear=False,
+            ):
+                codex_index.main(["--shared", "--db", str(db)])
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(
+                    {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
+                    {"shared-session"},
+                )
 
     def test_missing_shared_input_does_not_reset_an_existing_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
