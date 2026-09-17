@@ -283,6 +283,9 @@ def index_sessions(
         parsed = parse_session_file(path)
         if parsed is None:
             continue
+        # Remove any prior session that occupied this path before deciding whether
+        # another, newer path should retain this parsed session ID.
+        cursor.execute("DELETE FROM sessions WHERE source_path=?", (source_path,))
         existing_session = cursor.execute(
             "SELECT source_path, file_mtime_ns FROM sessions WHERE session_id=?",
             (parsed.session_id,),
@@ -294,8 +297,8 @@ def index_sessions(
         ):
             skipped += 1
             continue
-        # A path can be replaced with another session after a restore; remove either identity first.
-        cursor.execute("DELETE FROM sessions WHERE source_path=? OR session_id=?", (source_path, parsed.session_id))
+        # A session can move paths after a restore; retain only this current identity.
+        cursor.execute("DELETE FROM sessions WHERE session_id=?", (parsed.session_id,))
         user_count = sum(message.role == "user" for message in parsed.messages)
         assistant_count = sum(message.role == "assistant" for message in parsed.messages)
         cursor.execute(

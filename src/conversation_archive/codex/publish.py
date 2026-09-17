@@ -38,6 +38,16 @@ def iter_session_files(input_path: Path) -> list[tuple[Path, Path]]:
     ]
 
 
+def ensure_destination_parent(archive_root: Path, destination: Path) -> None:
+    """Create a destination parent without following an existing symlink."""
+    directory = archive_root
+    for component in destination.parent.relative_to(archive_root).parts:
+        directory = directory / component
+        if directory.is_symlink():
+            raise ValueError(f"Codex session archive destination contains a symlink: {directory}")
+        directory.mkdir(exist_ok=True)
+
+
 def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
@@ -51,10 +61,11 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
     if not source_root.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
 
+    archive_root.mkdir(parents=True, exist_ok=True)
     copied = skipped = 0
     for source, relative_path in iter_session_files(source_root):
         destination = destination_root / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        ensure_destination_parent(archive_root, destination)
         if destination.exists() and filecmp.cmp(source, destination, shallow=False):
             skipped += 1
             continue
@@ -62,6 +73,7 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
         try:
             shutil.copyfile(source, temporary)
+            temporary.chmod(source.stat().st_mode & 0o777)
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)
