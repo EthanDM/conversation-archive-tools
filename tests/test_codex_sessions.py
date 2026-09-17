@@ -16,6 +16,7 @@ sys.path.insert(0, str(SOURCE_DIR))
 
 from conversation_archive.codex.context_candidates import build_candidates, load_rules
 from conversation_archive.codex import index as codex_index
+from conversation_archive.codex import session_index
 from conversation_archive.codex.publish import publish_sessions
 from conversation_archive.codex.search import search
 from conversation_archive.codex.session_index import index_sessions, parse_session_file
@@ -314,6 +315,35 @@ class CodexSessionIndexTests(unittest.TestCase):
                     {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
                     {"session-1", "session-2"},
                 )
+
+    def test_limit_excludes_later_duplicate_reconciliation_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            winner = self.write_fixture(root / "sessions", "a.jsonl")
+            remaining_copy = self.write_fixture(root / "sessions", "z.jsonl")
+            os.utime(winner, ns=(winner.stat().st_atime_ns, winner.stat().st_mtime_ns + 1))
+            db = root / "index.sqlite"
+            index_sessions(root / "sessions", db)
+
+            winner.write_text(winner.read_text(encoding="utf-8").replace('"session-1"', '"session-2"'), encoding="utf-8")
+            index_sessions(root / "sessions", db, limit=1)
+
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(
+                    {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
+                    {"session-2"},
+                )
+            self.assertTrue(remaining_copy.exists())
+
+    def test_unchanged_index_does_not_reparse_sessions_for_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            index_sessions(root / "sessions", db)
+            with patch.object(session_index, "parse_session_file") as parse:
+                index_sessions(root / "sessions", db)
+            parse.assert_not_called()
 
     def test_removed_duplicate_winner_restores_the_remaining_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

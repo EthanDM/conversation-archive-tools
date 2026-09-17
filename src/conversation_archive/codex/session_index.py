@@ -295,6 +295,17 @@ def replace_session(
     return len(parsed.messages)
 
 
+def parse_session_snapshot(path: Path) -> Optional[tuple[object, ParsedSession]]:
+    """Parse a stable session-file snapshot, retrying one concurrent replacement."""
+    for _ in range(2):
+        before = path.stat()
+        parsed = parse_session_file(path)
+        after = path.stat()
+        if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
+            return after, parsed
+    return None
+
+
 def index_sessions(
     input_path: Path,
     db_path: Path,
@@ -319,6 +330,8 @@ def index_sessions(
         for suffix in ("", "-wal", "-shm"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
     paths = list(iter_session_files(input_path))
+    if limit is not None:
+        paths = paths[:limit]
     source_paths = {str(path.resolve()) for path in paths}
     connection = connect(db_path)
     cursor = connection.cursor()
@@ -327,8 +340,6 @@ def index_sessions(
     displaced_session_ids: set[str] = set()
 
     for path in paths:
-        if limit is not None and indexed + skipped >= limit:
-            break
         stat = path.stat()
         source_path = str(path.resolve())
         existing = cursor.execute(
@@ -360,18 +371,22 @@ def index_sessions(
         retained_messages += replace_session(cursor, parsed, source_path, stat)
         indexed += 1
 
-    displaced_candidates: dict[str, tuple[Path, ParsedSession]] = {}
-    for path in paths:
-        parsed = parse_session_file(path)
-        if parsed is None or parsed.session_id not in displaced_session_ids:
-            continue
-        candidate = displaced_candidates.get(parsed.session_id)
-        if candidate is None or path.stat().st_mtime_ns > candidate[0].stat().st_mtime_ns:
-            displaced_candidates[parsed.session_id] = (path, parsed)
+    if displaced_session_ids:
+        displaced_candidates: dict[str, tuple[Path, object, ParsedSession]] = {}
+        for path in paths:
+            snapshot = parse_session_snapshot(path)
+            if snapshot is None:
+                continue
+            stat, parsed = snapshot
+            if parsed is None or parsed.session_id not in displaced_session_ids:
+                continue
+            candidate = displaced_candidates.get(parsed.session_id)
+            if candidate is None or stat.st_mtime_ns > candidate[1].st_mtime_ns:
+                displaced_candidates[parsed.session_id] = (path, stat, parsed)
 
-    for path, parsed in displaced_candidates.values():
-        retained_messages += replace_session(cursor, parsed, str(path.resolve()), path.stat())
-        indexed += 1
+        for path, stat, parsed in displaced_candidates.values():
+            retained_messages += replace_session(cursor, parsed, str(path.resolve()), stat)
+            indexed += 1
 
     cursor.execute(
         "INSERT INTO index_meta(key, value) VALUES('indexer_version', ?) "
