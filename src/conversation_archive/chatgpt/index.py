@@ -357,9 +357,6 @@ def _extract_zip_export(input_path: Path, destination: Path) -> None:
 
 
 SCHEMA_SQL = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-
 CREATE TABLE IF NOT EXISTS index_meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -438,28 +435,34 @@ END;
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     fts_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
     ).fetchone()
     if fts_row and "content='messages'" in (fts_row[0] or ""):
-        conn.executescript(
-            """
-            DROP TRIGGER IF EXISTS messages_ai;
-            DROP TRIGGER IF EXISTS messages_ad;
-            DROP TRIGGER IF EXISTS messages_au;
-            DROP TABLE messages_fts;
-            """
-        )
-    conn.executescript(SCHEMA_SQL)
-    if fts_row and "content='messages'" in (fts_row[0] or ""):
-        conn.execute(
-            """
+        try:
+            conn.executescript(
+                """
+                BEGIN IMMEDIATE;
+                DROP TRIGGER IF EXISTS messages_ai;
+                DROP TRIGGER IF EXISTS messages_ad;
+                DROP TRIGGER IF EXISTS messages_au;
+                DROP TABLE messages_fts;
+                """
+                + SCHEMA_SQL
+                + """
             INSERT INTO messages_fts(rowid, text, conversation_id, title, role, create_time_iso)
             SELECT m.id, m.text, m.conversation_id, c.title, m.role, m.create_time_iso
-            FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id
-            """
-        )
-        conn.commit()
+            FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id;
+                COMMIT;
+                """
+            )
+        except Exception:
+            conn.rollback()
+            raise
+    else:
+        conn.executescript(SCHEMA_SQL)
     return conn
 
 

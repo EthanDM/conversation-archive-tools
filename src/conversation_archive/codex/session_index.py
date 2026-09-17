@@ -273,15 +273,26 @@ def index_sessions(
             break
         stat = path.stat()
         source_path = str(path.resolve())
-        if incremental:
-            existing = cursor.execute(
-                "SELECT file_size, file_mtime_ns FROM sessions WHERE source_path=?", (source_path,)
-            ).fetchone()
-            if existing and existing[0] == stat.st_size and existing[1] == stat.st_mtime_ns:
+        existing = cursor.execute(
+            "SELECT file_size, file_mtime_ns FROM sessions WHERE source_path=?", (source_path,)
+        ).fetchone()
+        if incremental and existing:
+            if existing[0] == stat.st_size and existing[1] == stat.st_mtime_ns:
                 skipped += 1
                 continue
         parsed = parse_session_file(path)
         if parsed is None:
+            continue
+        existing_session = cursor.execute(
+            "SELECT source_path, file_mtime_ns FROM sessions WHERE session_id=?",
+            (parsed.session_id,),
+        ).fetchone()
+        if (
+            existing_session
+            and existing_session[0] != source_path
+            and existing_session[1] >= stat.st_mtime_ns
+        ):
+            skipped += 1
             continue
         # A path can be replaced with another session after a restore; remove either identity first.
         cursor.execute("DELETE FROM sessions WHERE source_path=? OR session_id=?", (source_path, parsed.session_id))

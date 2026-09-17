@@ -29,12 +29,12 @@ class PublishResult:
 def iter_session_files(input_path: Path) -> list[tuple[Path, Path]]:
     if input_path.is_file():
         if input_path.suffix != ".jsonl":
-            return []
+            raise ValueError(f"Codex session input is not a JSONL file: {input_path}")
         return [(input_path, Path(input_path.name))]
     return [
         (path, path.relative_to(input_path))
         for path in sorted(input_path.rglob("*.jsonl"))
-        if path.is_file()
+        if path.is_file() and not path.is_symlink()
     ]
 
 
@@ -61,7 +61,7 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
 
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
         try:
-            shutil.copy2(source, temporary)
+            shutil.copyfile(source, temporary)
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)

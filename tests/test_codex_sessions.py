@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -161,6 +162,59 @@ class CodexSessionIndexTests(unittest.TestCase):
             self.write_fixture(sessions)
             with self.assertRaisesRegex(ValueError, "must not be inside its input"):
                 publish_sessions(sessions, sessions / "archive", "desktop")
+
+    def test_publisher_skips_symlinks_outside_the_selected_sessions_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            outside = self.write_fixture(root / "outside")
+            sessions.mkdir()
+            (sessions / "linked.jsonl").symlink_to(outside)
+            result = publish_sessions(sessions, root / "archive", "desktop")
+            self.assertEqual((result.copied, result.skipped), (0, 0))
+            self.assertFalse((result.destination / "linked.jsonl").exists())
+
+    def test_shared_index_prefers_the_newest_duplicate_session_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions / "2026" / "09")
+            archive = root / "archive"
+            publish_sessions(source, archive, "desktop")
+            flat_copy = archive / "desktop" / source.name
+            source.write_text(source.read_text(encoding="utf-8") + message("user", "A newer archived request."), encoding="utf-8")
+            publish_sessions(sessions, archive, "desktop")
+            os.utime(flat_copy, ns=(flat_copy.stat().st_atime_ns, flat_copy.stat().st_mtime_ns - 1))
+            db = root / "index.sqlite"
+            index_sessions(archive, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT text FROM messages ORDER BY seq DESC LIMIT 1").fetchone()[0],
+                    "A newer archived request.",
+                )
+
+    def test_changed_copy_reindexes_when_source_mtime_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions)
+            archive = root / "archive"
+            publish_sessions(sessions, archive, "desktop")
+            db = root / "index.sqlite"
+            index_sessions(archive, db)
+            original = source.stat()
+            source.write_text(
+                source.read_text(encoding="utf-8").replace("browser-only", "offline-tool"),
+                encoding="utf-8",
+            )
+            os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+            publish_sessions(sessions, archive, "desktop")
+            index_sessions(archive, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT count(*) FROM messages WHERE text LIKE '%offline-tool%'").fetchone()[0],
+                    1,
+                )
 
     def test_shared_index_rejects_explicit_input(self) -> None:
         with self.assertRaises(SystemExit):
