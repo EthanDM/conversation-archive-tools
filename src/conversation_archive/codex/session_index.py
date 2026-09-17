@@ -241,15 +241,18 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def scope_index_to_input(cursor: sqlite3.Cursor, input_path: Path) -> None:
-    """Remove rows that do not belong to the requested input file or directory."""
+def scope_index_to_input(cursor: sqlite3.Cursor, input_path: Path, source_paths: set[str]) -> None:
+    """Remove rows outside the input or whose source file is no longer present."""
     out_of_scope = [
         (source_path,)
         for (source_path,) in cursor.execute("SELECT source_path FROM sessions")
         if (
-            Path(source_path) != input_path
-            if input_path.is_file()
-            else not Path(source_path).is_relative_to(input_path)
+            source_path not in source_paths
+            or (
+                Path(source_path) != input_path
+                if input_path.is_file()
+                else not Path(source_path).is_relative_to(input_path)
+            )
         )
     ]
     cursor.executemany("DELETE FROM sessions WHERE source_path=?", out_of_scope)
@@ -315,11 +318,12 @@ def index_sessions(
     if reset:
         for suffix in ("", "-wal", "-shm"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+    paths = list(iter_session_files(input_path))
+    source_paths = {str(path.resolve()) for path in paths}
     connection = connect(db_path)
     cursor = connection.cursor()
-    scope_index_to_input(cursor, input_path)
+    scope_index_to_input(cursor, input_path, source_paths)
     indexed = skipped = retained_messages = 0
-    paths = list(iter_session_files(input_path))
     displaced_session_ids: set[str] = set()
 
     for path in paths:
@@ -356,15 +360,16 @@ def index_sessions(
         retained_messages += replace_session(cursor, parsed, source_path, stat)
         indexed += 1
 
-    for session_id in displaced_session_ids:
-        candidates = [
-            (path, parsed)
-            for path in paths
-            if (parsed := parse_session_file(path)) is not None and parsed.session_id == session_id
-        ]
-        if not candidates:
+    displaced_candidates: dict[str, tuple[Path, ParsedSession]] = {}
+    for path in paths:
+        parsed = parse_session_file(path)
+        if parsed is None or parsed.session_id not in displaced_session_ids:
             continue
-        path, parsed = max(candidates, key=lambda candidate: candidate[0].stat().st_mtime_ns)
+        candidate = displaced_candidates.get(parsed.session_id)
+        if candidate is None or path.stat().st_mtime_ns > candidate[0].stat().st_mtime_ns:
+            displaced_candidates[parsed.session_id] = (path, parsed)
+
+    for path, parsed in displaced_candidates.values():
         retained_messages += replace_session(cursor, parsed, str(path.resolve()), path.stat())
         indexed += 1
 

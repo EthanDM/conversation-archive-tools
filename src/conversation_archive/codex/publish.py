@@ -48,6 +48,12 @@ def ensure_destination_parent(archive_root: Path, destination: Path) -> None:
         directory.mkdir(exist_ok=True)
 
 
+def contents_match(source: Path, destination: Path) -> bool:
+    """Compare content without retaining stale results for preserved file metadata."""
+    filecmp.clear_cache()
+    return filecmp.cmp(source, destination, shallow=False)
+
+
 def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
@@ -72,7 +78,7 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
         if (
             destination.exists()
             and destination.stat().st_mode & 0o777 == source_mode
-            and filecmp.cmp(source, destination, shallow=False)
+            and contents_match(source, destination)
         ):
             skipped += 1
             continue

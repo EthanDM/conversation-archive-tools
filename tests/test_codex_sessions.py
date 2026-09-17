@@ -262,6 +262,23 @@ class CodexSessionIndexTests(unittest.TestCase):
                     1,
                 )
 
+    def test_publisher_does_not_reuse_a_stale_content_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions)
+            archive = root / "archive"
+            publish_sessions(sessions, archive, "desktop")
+            publish_sessions(sessions, archive, "desktop")
+            original = source.stat()
+            source.write_text(
+                source.read_text(encoding="utf-8").replace("browser-only", "offline-tool"),
+                encoding="utf-8",
+            )
+            os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+            result = publish_sessions(sessions, archive, "desktop")
+            self.assertEqual((result.copied, result.skipped), (1, 0))
+
     def test_duplicate_suppression_removes_the_stale_path_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -297,6 +314,20 @@ class CodexSessionIndexTests(unittest.TestCase):
                     {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
                     {"session-1", "session-2"},
                 )
+
+    def test_removed_duplicate_winner_restores_the_remaining_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            older = self.write_fixture(root / "sessions", "a.jsonl")
+            newer = self.write_fixture(root / "sessions", "z.jsonl")
+            os.utime(newer, ns=(newer.stat().st_atime_ns, newer.stat().st_mtime_ns + 1))
+            db = root / "index.sqlite"
+            index_sessions(root / "sessions", db)
+            newer.unlink()
+            index_sessions(root / "sessions", db)
+
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT source_path FROM sessions").fetchone()[0], str(older.resolve()))
 
     def test_shared_index_rejects_explicit_input(self) -> None:
         with self.assertRaises(SystemExit):
