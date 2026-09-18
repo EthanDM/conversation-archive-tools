@@ -331,7 +331,7 @@ class CodexSessionIndexTests(unittest.TestCase):
             with sqlite3.connect(db) as connection:
                 self.assertEqual(
                     {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
-                    {"session-2"},
+                    {"session-1", "session-2"},
                 )
             self.assertTrue(remaining_copy.exists())
 

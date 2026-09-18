@@ -231,7 +231,11 @@ def iter_session_files(input_path: Path) -> Iterator[Path]:
     if input_path.is_file():
         yield input_path
         return
-    yield from sorted(input_path.rglob("*.jsonl"))
+    yield from (
+        path
+        for path in sorted(input_path.rglob("*.jsonl"))
+        if not path.is_symlink() and path.resolve().is_relative_to(input_path)
+    )
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -329,10 +333,11 @@ def index_sessions(
     if reset:
         for suffix in ("", "-wal", "-shm"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
-    paths = list(iter_session_files(input_path))
+    all_paths = list(iter_session_files(input_path))
+    source_paths = {str(path.resolve()) for path in all_paths}
+    paths = all_paths
     if limit is not None:
         paths = paths[:limit]
-    source_paths = {str(path.resolve()) for path in paths}
     connection = connect(db_path)
     cursor = connection.cursor()
     scope_index_to_input(cursor, input_path, source_paths)
@@ -385,6 +390,12 @@ def index_sessions(
                 displaced_candidates[parsed.session_id] = (path, stat, parsed)
 
         for path, stat, parsed in displaced_candidates.values():
+            existing = cursor.execute(
+                "SELECT session_id, file_size, file_mtime_ns FROM sessions WHERE source_path=?",
+                (str(path.resolve()),),
+            ).fetchone()
+            if existing == (parsed.session_id, stat.st_size, stat.st_mtime_ns):
+                continue
             retained_messages += replace_session(cursor, parsed, str(path.resolve()), stat)
             indexed += 1
 

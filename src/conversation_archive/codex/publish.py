@@ -77,6 +77,7 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
         source_mode = source.stat().st_mode & 0o777
         if (
             destination.exists()
+            and not os.path.samestat(source.stat(), destination.stat())
             and destination.stat().st_mode & 0o777 == source_mode
             and contents_match(source, destination)
         ):
@@ -85,6 +86,8 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
 
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
         try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode)
+            os.close(descriptor)
             shutil.copyfile(source, temporary)
             temporary.chmod(source_mode)
             os.replace(temporary, destination)
