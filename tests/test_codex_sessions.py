@@ -246,6 +246,19 @@ class CodexSessionIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different single-file session"):
                 publish_sessions(second, archive, "desktop")
 
+    def test_publisher_updates_a_single_file_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            archive = root / "archive"
+            publish_sessions(source, archive, "desktop")
+            source.write_text(
+                source.read_text(encoding="utf-8") + message("user", "A later request."),
+                encoding="utf-8",
+            )
+            result = publish_sessions(source, archive, "desktop")
+            self.assertEqual((result.copied, result.skipped), (1, 0))
+
     def test_publisher_replaces_multiply_linked_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

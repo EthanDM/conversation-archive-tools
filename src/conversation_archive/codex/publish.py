@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import filecmp
+import json
 import os
 import shutil
 import sys
@@ -54,6 +55,22 @@ def contents_match(source: Path, destination: Path) -> bool:
     return filecmp.cmp(source, destination, shallow=False)
 
 
+def session_id(path: Path) -> str | None:
+    """Return the Codex session ID recorded in a JSONL file, if present."""
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = event.get("payload")
+            if event.get("type") == "session_meta" and isinstance(payload, dict):
+                value = payload.get("id")
+                if isinstance(value, str):
+                    return value
+    return None
+
+
 def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
@@ -76,10 +93,11 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
             raise ValueError(f"Codex session archive destination is a symlink: {destination}")
         source_mode = source.stat().st_mode & 0o777
         if input_path.is_file() and destination.exists() and not contents_match(source, destination):
-            raise ValueError(
-                "Codex session archive destination already contains a different single-file session: "
-                f"{destination}"
-            )
+            if session_id(source) != session_id(destination):
+                raise ValueError(
+                    "Codex session archive destination already contains a different single-file session: "
+                    f"{destination}"
+                )
         if (
             destination.exists()
             and not os.path.samestat(source.stat(), destination.stat())
