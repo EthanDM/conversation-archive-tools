@@ -245,13 +245,19 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def scope_index_to_input(cursor: sqlite3.Cursor, input_path: Path, source_paths: set[str]) -> None:
+def scope_index_to_input(
+    cursor: sqlite3.Cursor,
+    input_path: Path,
+    source_paths: set[str],
+    *,
+    remove_missing: bool,
+) -> None:
     """Remove rows outside the input or whose source file is no longer present."""
     out_of_scope = [
         (source_path,)
         for (source_path,) in cursor.execute("SELECT source_path FROM sessions")
         if (
-            source_path not in source_paths
+            (remove_missing and source_path not in source_paths)
             or (
                 Path(source_path) != input_path
                 if input_path.is_file()
@@ -340,7 +346,7 @@ def index_sessions(
         paths = paths[:limit]
     connection = connect(db_path)
     cursor = connection.cursor()
-    scope_index_to_input(cursor, input_path, source_paths)
+    scope_index_to_input(cursor, input_path, source_paths, remove_missing=limit is None)
     indexed = skipped = retained_messages = 0
     displaced_session_ids: set[str] = set()
 

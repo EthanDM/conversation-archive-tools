@@ -75,6 +75,11 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
         if destination.is_symlink():
             raise ValueError(f"Codex session archive destination is a symlink: {destination}")
         source_mode = source.stat().st_mode & 0o777
+        if input_path.is_file() and destination.exists() and not contents_match(source, destination):
+            raise ValueError(
+                "Codex session archive destination already contains a different single-file session: "
+                f"{destination}"
+            )
         if (
             destination.exists()
             and not os.path.samestat(source.stat(), destination.stat())

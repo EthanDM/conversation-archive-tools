@@ -232,6 +232,20 @@ class CodexSessionIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "destination is a symlink"):
                 publish_sessions(sessions, archive, "desktop")
 
+    def test_publisher_rejects_conflicting_single_file_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.write_fixture(root / "first")
+            second = self.write_fixture(root / "second")
+            second.write_text(
+                second.read_text(encoding="utf-8").replace('"session-1"', '"session-2"'),
+                encoding="utf-8",
+            )
+            archive = root / "archive"
+            publish_sessions(first, archive, "desktop")
+            with self.assertRaisesRegex(ValueError, "different single-file session"):
+                publish_sessions(second, archive, "desktop")
+
     def test_publisher_replaces_multiply_linked_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -360,6 +374,30 @@ class CodexSessionIndexTests(unittest.TestCase):
                     {"session-1", "session-2"},
                 )
             self.assertTrue(remaining_copy.exists())
+
+    def test_limit_preserves_a_deleted_duplicate_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.write_fixture(root / "sessions", "a.jsonl")
+            deleted_winner = self.write_fixture(root / "sessions", "b.jsonl")
+            last = self.write_fixture(root / "sessions", "z.jsonl")
+            os.utime(
+                deleted_winner,
+                ns=(
+                    deleted_winner.stat().st_atime_ns,
+                    max(first.stat().st_mtime_ns, last.stat().st_mtime_ns) + 1,
+                ),
+            )
+            db = root / "index.sqlite"
+            index_sessions(root / "sessions", db)
+            deleted_winner.unlink()
+            index_sessions(root / "sessions", db, limit=1)
+
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT source_path FROM sessions").fetchone()[0],
+                    str(deleted_winner.resolve()),
+                )
 
     def test_unchanged_index_does_not_reparse_sessions_for_reconciliation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
