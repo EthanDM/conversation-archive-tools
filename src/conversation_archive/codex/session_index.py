@@ -356,6 +356,9 @@ def index_sessions(
                 continue
         parsed = parse_session_file(path)
         if parsed is None:
+            if existing:
+                displaced_session_ids.add(existing[0])
+                cursor.execute("DELETE FROM sessions WHERE source_path=?", (source_path,))
             continue
         if existing and existing[0] != parsed.session_id:
             displaced_session_ids.add(existing[0])

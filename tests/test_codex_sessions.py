@@ -196,6 +196,17 @@ class CodexSessionIndexTests(unittest.TestCase):
             destination = result.destination / source.name
             self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
+    def test_publisher_copies_read_only_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions)
+            source.chmod(0o400)
+            result = publish_sessions(sessions, root / "archive", "desktop")
+            destination = result.destination / source.name
+            self.assertEqual((result.copied, result.skipped), (1, 0))
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o400)
+
     def test_publisher_updates_permission_only_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -220,6 +231,21 @@ class CodexSessionIndexTests(unittest.TestCase):
             destination.symlink_to(source)
             with self.assertRaisesRegex(ValueError, "destination is a symlink"):
                 publish_sessions(sessions, archive, "desktop")
+
+    def test_publisher_replaces_multiply_linked_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            source = self.write_fixture(sessions)
+            archive = root / "archive"
+            initial = publish_sessions(sessions, archive, "desktop")
+            destination = initial.destination / source.name
+            alias = root / "archive-alias.jsonl"
+            os.link(destination, alias)
+            result = publish_sessions(sessions, archive, "desktop")
+            self.assertEqual((result.copied, result.skipped), (1, 0))
+            self.assertEqual(destination.stat().st_nlink, 1)
+            self.assertEqual(alias.stat().st_nlink, 1)
 
     def test_shared_index_prefers_the_newest_duplicate_session_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -354,6 +380,20 @@ class CodexSessionIndexTests(unittest.TestCase):
             db = root / "index.sqlite"
             index_sessions(root / "sessions", db)
             newer.unlink()
+            index_sessions(root / "sessions", db)
+
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT source_path FROM sessions").fetchone()[0], str(older.resolve()))
+
+    def test_malformed_duplicate_winner_restores_the_remaining_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            older = self.write_fixture(root / "sessions", "a.jsonl")
+            newer = self.write_fixture(root / "sessions", "z.jsonl")
+            os.utime(newer, ns=(newer.stat().st_atime_ns, newer.stat().st_mtime_ns + 1))
+            db = root / "index.sqlite"
+            index_sessions(root / "sessions", db)
+            newer.write_text("not valid session metadata\n", encoding="utf-8")
             index_sessions(root / "sessions", db)
 
             with sqlite3.connect(db) as connection:
