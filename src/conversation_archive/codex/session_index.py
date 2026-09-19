@@ -231,7 +231,11 @@ def iter_session_files(input_path: Path) -> Iterator[Path]:
     if input_path.is_file():
         yield input_path
         return
-    yield from sorted(input_path.rglob("*.jsonl"))
+    yield from (
+        path
+        for path in sorted(input_path.rglob("*.jsonl"))
+        if not path.is_symlink() and path.resolve().is_relative_to(input_path)
+    )
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -239,6 +243,77 @@ def connect(db_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys=ON")
     connection.executescript(SCHEMA_SQL)
     return connection
+
+
+def scope_index_to_input(
+    cursor: sqlite3.Cursor,
+    input_path: Path,
+    source_paths: set[str],
+    *,
+    remove_missing: bool,
+) -> None:
+    """Remove rows outside the input or whose source file is no longer present."""
+    out_of_scope = [
+        (source_path,)
+        for (source_path,) in cursor.execute("SELECT source_path FROM sessions")
+        if (
+            (remove_missing and source_path not in source_paths)
+            or (
+                Path(source_path) != input_path
+                if input_path.is_file()
+                else not Path(source_path).is_relative_to(input_path)
+            )
+        )
+    ]
+    cursor.executemany("DELETE FROM sessions WHERE source_path=?", out_of_scope)
+
+
+def replace_session(
+    cursor: sqlite3.Cursor, parsed: ParsedSession, source_path: str, stat: object
+) -> int:
+    """Replace either identity with one parsed session and return its message count."""
+    cursor.execute("DELETE FROM sessions WHERE source_path=? OR session_id=?", (source_path, parsed.session_id))
+    user_count = sum(message.role == "user" for message in parsed.messages)
+    assistant_count = sum(message.role == "assistant" for message in parsed.messages)
+    cursor.execute(
+        """
+        INSERT INTO sessions(
+          session_id, source_path, cwd, title, first_time_iso, last_time_iso,
+          file_size, file_mtime_ns, user_message_count, assistant_message_count
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            parsed.session_id,
+            source_path,
+            parsed.cwd,
+            parsed.title,
+            parsed.first_time_iso,
+            parsed.last_time_iso,
+            stat.st_size,
+            stat.st_mtime_ns,
+            user_count,
+            assistant_count,
+        ),
+    )
+    cursor.executemany(
+        "INSERT INTO messages(session_id, seq, role, create_time_iso, text) VALUES (?,?,?,?,?)",
+        [
+            (parsed.session_id, sequence, message.role, message.create_time_iso, message.text)
+            for sequence, message in enumerate(parsed.messages, start=1)
+        ],
+    )
+    return len(parsed.messages)
+
+
+def parse_session_snapshot(path: Path) -> Optional[tuple[object, ParsedSession]]:
+    """Parse a stable session-file snapshot, retrying one concurrent replacement."""
+    for _ in range(2):
+        before = path.stat()
+        parsed = parse_session_file(path)
+        after = path.stat()
+        if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
+            return after, parsed
+    return None
 
 
 def index_sessions(
@@ -255,62 +330,83 @@ def index_sessions(
     files replace prior rows for either their path or their session ID. ``reset``
     removes only the target SQLite database and its WAL sidecars.
     """
+    input_path = input_path.expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Codex session input does not exist: {input_path}")
+    if not input_path.is_file() and not input_path.is_dir():
+        raise ValueError(f"Codex session input is not a file or directory: {input_path}")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if reset:
         for suffix in ("", "-wal", "-shm"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+    all_paths = list(iter_session_files(input_path))
+    source_paths = {str(path.resolve()) for path in all_paths}
+    paths = all_paths
+    if limit is not None:
+        paths = paths[:limit]
     connection = connect(db_path)
     cursor = connection.cursor()
+    scope_index_to_input(cursor, input_path, source_paths, remove_missing=limit is None)
     indexed = skipped = retained_messages = 0
+    displaced_session_ids: set[str] = set()
 
-    for path in iter_session_files(input_path):
-        if limit is not None and indexed + skipped >= limit:
-            break
+    for path in paths:
         stat = path.stat()
         source_path = str(path.resolve())
-        if incremental:
-            existing = cursor.execute(
-                "SELECT file_size, file_mtime_ns FROM sessions WHERE source_path=?", (source_path,)
-            ).fetchone()
-            if existing and existing[0] == stat.st_size and existing[1] == stat.st_mtime_ns:
+        existing = cursor.execute(
+            "SELECT session_id, file_size, file_mtime_ns FROM sessions WHERE source_path=?", (source_path,)
+        ).fetchone()
+        if incremental and existing:
+            if existing[1] == stat.st_size and existing[2] == stat.st_mtime_ns:
                 skipped += 1
                 continue
         parsed = parse_session_file(path)
         if parsed is None:
+            if existing:
+                displaced_session_ids.add(existing[0])
+                cursor.execute("DELETE FROM sessions WHERE source_path=?", (source_path,))
             continue
-        # A path can be replaced with another session after a restore; remove either identity first.
-        cursor.execute("DELETE FROM sessions WHERE source_path=? OR session_id=?", (source_path, parsed.session_id))
-        user_count = sum(message.role == "user" for message in parsed.messages)
-        assistant_count = sum(message.role == "assistant" for message in parsed.messages)
-        cursor.execute(
-            """
-            INSERT INTO sessions(
-              session_id, source_path, cwd, title, first_time_iso, last_time_iso,
-              file_size, file_mtime_ns, user_message_count, assistant_message_count
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                parsed.session_id,
-                source_path,
-                parsed.cwd,
-                parsed.title,
-                parsed.first_time_iso,
-                parsed.last_time_iso,
-                stat.st_size,
-                stat.st_mtime_ns,
-                user_count,
-                assistant_count,
-            ),
-        )
-        cursor.executemany(
-            "INSERT INTO messages(session_id, seq, role, create_time_iso, text) VALUES (?,?,?,?,?)",
-            [
-                (parsed.session_id, sequence, message.role, message.create_time_iso, message.text)
-                for sequence, message in enumerate(parsed.messages, start=1)
-            ],
-        )
+        if existing and existing[0] != parsed.session_id:
+            displaced_session_ids.add(existing[0])
+        # Remove any prior session that occupied this path before deciding whether
+        # another, newer path should retain this parsed session ID.
+        cursor.execute("DELETE FROM sessions WHERE source_path=?", (source_path,))
+        existing_session = cursor.execute(
+            "SELECT source_path, file_mtime_ns FROM sessions WHERE session_id=?",
+            (parsed.session_id,),
+        ).fetchone()
+        if (
+            existing_session
+            and existing_session[0] != source_path
+            and existing_session[1] >= stat.st_mtime_ns
+        ):
+            skipped += 1
+            continue
+        retained_messages += replace_session(cursor, parsed, source_path, stat)
         indexed += 1
-        retained_messages += len(parsed.messages)
+
+    if displaced_session_ids:
+        displaced_candidates: dict[str, tuple[Path, object, ParsedSession]] = {}
+        for path in paths:
+            snapshot = parse_session_snapshot(path)
+            if snapshot is None:
+                continue
+            stat, parsed = snapshot
+            if parsed is None or parsed.session_id not in displaced_session_ids:
+                continue
+            candidate = displaced_candidates.get(parsed.session_id)
+            if candidate is None or stat.st_mtime_ns > candidate[1].st_mtime_ns:
+                displaced_candidates[parsed.session_id] = (path, stat, parsed)
+
+        for path, stat, parsed in displaced_candidates.values():
+            existing = cursor.execute(
+                "SELECT session_id, file_size, file_mtime_ns FROM sessions WHERE source_path=?",
+                (str(path.resolve()),),
+            ).fetchone()
+            if existing == (parsed.session_id, stat.st_size, stat.st_mtime_ns):
+                continue
+            retained_messages += replace_session(cursor, parsed, str(path.resolve()), stat)
+            indexed += 1
 
     cursor.execute(
         "INSERT INTO index_meta(key, value) VALUES('indexer_version', ?) "

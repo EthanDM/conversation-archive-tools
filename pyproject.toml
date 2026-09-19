@@ -25,6 +25,7 @@ conversation-archive-search-chatgpt = "conversation_archive.entrypoints:search_c
 conversation-archive-show-chatgpt = "conversation_archive.entrypoints:show_chatgpt"
 conversation-archive-refresh-chatgpt = "conversation_archive.entrypoints:refresh_chatgpt"
 conversation-archive-index-codex = "conversation_archive.entrypoints:index_codex"
+conversation-archive-publish-codex = "conversation_archive.entrypoints:publish_codex"
 conversation-archive-search-codex = "conversation_archive.entrypoints:search_codex"
 conversation-archive-show-codex = "conversation_archive.entrypoints:show_codex"
 conversation-archive-context-candidates = "conversation_archive.entrypoints:context_candidates"
