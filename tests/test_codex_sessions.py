@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import errno
 import os
 import sqlite3
 import sys
@@ -177,6 +178,14 @@ class CodexSessionIndexTests(unittest.TestCase):
 
             self.assertFalse(codex_publish.atomically_create_file(path, "replacement\n"))
             self.assertEqual(path.read_text(encoding="utf-8"), "existing\n")
+
+    def test_atomic_file_creation_requires_hard_link_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            with patch.object(codex_publish.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")):
+                with self.assertRaisesRegex(ValueError, "require hard-link support"):
+                    codex_publish.atomically_create_file(path, "contents\n")
+            self.assertFalse(path.exists())
 
     def test_publisher_reserves_a_new_machine_id_and_reuses_its_own_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

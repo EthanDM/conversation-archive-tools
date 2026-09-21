@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import filecmp
 import json
 import os
@@ -85,6 +86,12 @@ def atomically_create_file(path: Path, contents: str) -> bool:
             os.link(temporary, path)
         except FileExistsError:
             return False
+        except OSError as error:
+            if error.errno in {errno.EOPNOTSUPP, errno.EXDEV, errno.EPERM}:
+                raise ValueError(
+                    f"Atomic Codex ownership records require hard-link support: {path.parent}"
+                ) from error
+            raise
         return True
     finally:
         temporary.unlink(missing_ok=True)
