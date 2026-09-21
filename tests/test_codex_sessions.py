@@ -179,6 +179,13 @@ class CodexSessionIndexTests(unittest.TestCase):
             self.assertFalse(codex_publish.atomically_create_file(path, "replacement\n"))
             self.assertEqual(path.read_text(encoding="utf-8"), "existing\n")
 
+    def test_atomic_file_creation_syncs_the_published_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            with patch.object(codex_publish, "fsync_directory") as fsync_directory:
+                self.assertTrue(codex_publish.atomically_create_file(path, "contents\n"))
+            fsync_directory.assert_called_once_with(path.parent)
+
     def test_atomic_file_creation_requires_hard_link_support(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "reservation.json"

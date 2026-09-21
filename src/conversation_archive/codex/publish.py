@@ -73,9 +73,18 @@ def session_id(path: Path) -> str | None:
     return None
 
 
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def atomically_create_file(path: Path, contents: str) -> bool:
     """Create a fully written file only when its destination does not exist."""
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    created = False
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
@@ -92,9 +101,12 @@ def atomically_create_file(path: Path, contents: str) -> bool:
                     f"Atomic Codex ownership records require hard-link support: {path.parent}"
                 ) from error
             raise
+        created = True
         return True
     finally:
         temporary.unlink(missing_ok=True)
+        if created:
+            fsync_directory(path.parent)
 
 
 def installation_id(path: Path) -> str:
