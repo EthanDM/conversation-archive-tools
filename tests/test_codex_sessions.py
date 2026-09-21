@@ -170,6 +170,14 @@ class CodexSessionIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Machine ID"):
                 publish_sessions(sessions, root / "archive", "../neo")
 
+    def test_atomic_file_creation_preserves_an_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            path.write_text("existing\n", encoding="utf-8")
+
+            self.assertFalse(codex_publish.atomically_create_file(path, "replacement\n"))
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing\n")
+
     def test_publisher_reserves_a_new_machine_id_and_reuses_its_own_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

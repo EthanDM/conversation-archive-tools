@@ -72,6 +72,24 @@ def session_id(path: Path) -> str | None:
     return None
 
 
+def atomically_create_file(path: Path, contents: str) -> bool:
+    """Create a fully written file only when its destination does not exist."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            destination.write(contents)
+            destination.flush()
+            os.fsync(destination.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def installation_id(path: Path) -> str:
     """Return this installation's persistent UUID without following a symlink."""
     path = path.expanduser()
@@ -89,13 +107,9 @@ def installation_id(path: Path) -> str:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     value = str(uuid.uuid4())
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return installation_id(path)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
-        destination.write(f"{value}\n")
-    return value
+    if atomically_create_file(path, f"{value}\n"):
+        return value
+    return installation_id(path)
 
 
 def reservation_path(archive_root: Path, machine_id: str) -> Path:
@@ -143,15 +157,11 @@ def reserve_machine_id(
         )
 
     payload = json.dumps({"installation_id": installation}, sort_keys=True) + "\n"
-    try:
-        descriptor = os.open(reservation, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        reserved_installation = read_reservation(reservation)
-        if reserved_installation != installation:
-            raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+    if atomically_create_file(reservation, payload):
         return
-    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
-        destination.write(payload)
+    reserved_installation = read_reservation(reservation)
+    if reserved_installation != installation:
+        raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
 
 
 def publish_sessions(
