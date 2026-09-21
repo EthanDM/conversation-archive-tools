@@ -79,8 +79,8 @@ The Codex index retains filtered user and assistant text for search. It excludes
 Keep Codex and every SQLite database local. To search history from multiple Macs, explicitly publish each Mac's JSONL session files into a private shared archive, then build a local index from that archive. This command never uploads data itself; the archive location is a local filesystem path managed by you.
 
 ```bash
-# On the first Mac
-conversation-archive-publish-codex --machine-id main-mbp
+# One-time claim for a populated legacy namespace on the first Mac
+conversation-archive-publish-codex --machine-id main-mbp --claim-existing-machine-id
 
 # On the other Mac
 conversation-archive-publish-codex --machine-id neo
@@ -90,6 +90,8 @@ conversation-archive-index-codex --shared --reset
 ```
 
 By default, the shared archive is `codex-sessions/` beneath the configured ChatGPT Archive root. Override it with `--archive-root` or `CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT`; set `CONVERSATION_ARCHIVE_MACHINE_ID` to avoid passing `--machine-id` each run. The publisher preserves each Mac's namespace, copies only changed `.jsonl` files atomically, and never deletes source or archived files.
+
+Each Mac also has a private local installation UUID at `~/Library/Application Support/Conversation Archive Tools/installation-id`. Before publishing, it atomically reserves its shared machine ID at `.machines/<machine-id>.json`. A reservation can only be reused by the same installation UUID. Existing populated namespaces created before this safeguard require the explicit one-time `--claim-existing-machine-id` command shown above; the publisher never silently claims them.
 
 Do not store `codex_sessions.sqlite` in shared storage or symlink `~/.codex/sessions`. The JSONL archive is shared; each Mac's SQLite index stays local.
 

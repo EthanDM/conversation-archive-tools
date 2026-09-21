@@ -16,6 +16,7 @@ sys.path.insert(0, str(SOURCE_DIR))
 
 from conversation_archive.codex.context_candidates import build_candidates, load_rules
 from conversation_archive.codex import index as codex_index
+from conversation_archive.codex import publish as codex_publish
 from conversation_archive.codex import session_index
 from conversation_archive.codex.publish import publish_sessions
 from conversation_archive.codex.search import search
@@ -32,6 +33,19 @@ def message(role: str, text: str, timestamp: str = "2026-08-12T12:01:00Z") -> st
 
 
 class CodexSessionIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.installation_directory = tempfile.TemporaryDirectory()
+        self.installation_patch = patch.object(
+            codex_publish,
+            "INSTALLATION_ID_PATH",
+            Path(self.installation_directory.name) / "installation-id",
+        )
+        self.installation_patch.start()
+
+    def tearDown(self) -> None:
+        self.installation_patch.stop()
+        self.installation_directory.cleanup()
+
     def write_fixture(self, directory: Path, name: str = "session.jsonl") -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / name
@@ -156,6 +170,90 @@ class CodexSessionIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Machine ID"):
                 publish_sessions(sessions, root / "archive", "../neo")
 
+    def test_publisher_reserves_a_new_machine_id_and_reuses_its_own_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+
+            first = publish_sessions(sessions, archive, "desktop")
+            reservation = archive / ".machines" / "desktop.json"
+            first_installation = json.loads(reservation.read_text(encoding="utf-8"))["installation_id"]
+            repeated = publish_sessions(sessions, archive, "desktop")
+
+            self.assertEqual((first.copied, first.skipped), (1, 0))
+            self.assertEqual((repeated.copied, repeated.skipped), (0, 1))
+            self.assertEqual(json.loads(reservation.read_text(encoding="utf-8"))["installation_id"], first_installation)
+
+    def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+            publish_sessions(sessions, archive, "desktop", installation_id_path=root / "first-id")
+
+            with self.assertRaisesRegex(ValueError, "already reserved"):
+                publish_sessions(sessions, archive, "desktop", installation_id_path=root / "second-id")
+
+    def test_publisher_requires_an_explicit_claim_for_a_populated_legacy_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+            self.write_fixture(archive / "desktop")
+
+            with self.assertRaisesRegex(ValueError, "claim-existing-machine-id"):
+                publish_sessions(sessions, archive, "desktop")
+            self.assertFalse((archive / ".machines" / "desktop.json").exists())
+
+            claimed = publish_sessions(sessions, archive, "desktop", claim_existing_machine_id=True)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 1))
+            self.assertTrue((archive / ".machines" / "desktop.json").is_file())
+
+    def test_publisher_rejects_symlinked_or_corrupt_machine_reservations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+            reservation = archive / ".machines" / "desktop.json"
+            reservation.parent.mkdir(parents=True)
+            reservation.symlink_to(root / "outside.json")
+
+            with self.assertRaisesRegex(ValueError, "reservation is a symlink"):
+                publish_sessions(sessions, archive, "desktop")
+
+            reservation.unlink()
+            reservation.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reservation is corrupt"):
+                publish_sessions(sessions, archive, "desktop")
+
+    def test_publisher_cli_exposes_and_passes_the_legacy_claim_flag(self) -> None:
+        self.assertIn("--claim-existing-machine-id", codex_publish.build_parser().format_help())
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ) as publish:
+            self.assertEqual(
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--claim-existing-machine-id",
+                    ]
+                ),
+                0,
+            )
+        self.assertTrue(publish.call_args.kwargs["claim_existing_machine_id"])
+
     def test_publisher_rejects_an_archive_inside_the_source_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -230,7 +328,7 @@ class CodexSessionIndexTests(unittest.TestCase):
             destination.parent.mkdir(parents=True)
             destination.symlink_to(source)
             with self.assertRaisesRegex(ValueError, "destination is a symlink"):
-                publish_sessions(sessions, archive, "desktop")
+                publish_sessions(sessions, archive, "desktop", claim_existing_machine_id=True)
 
     def test_publisher_rejects_conflicting_single_file_destinations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .paths import (
+    INSTALLATION_ID_PATH,
     default_input_path,
     default_machine_id,
     default_shared_input_path,
@@ -71,7 +72,96 @@ def session_id(path: Path) -> str | None:
     return None
 
 
-def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> PublishResult:
+def installation_id(path: Path) -> str:
+    """Return this installation's persistent UUID without following a symlink."""
+    path = path.expanduser()
+    if path.is_symlink():
+        raise ValueError(f"Codex installation ID is a symlink: {path}")
+
+    if path.exists():
+        if not path.is_file():
+            raise ValueError(f"Codex installation ID is not a file: {path}")
+        value = path.read_text(encoding="utf-8").strip()
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as error:
+            raise ValueError(f"Codex installation ID is invalid: {path}") from error
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value = str(uuid.uuid4())
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return installation_id(path)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+        destination.write(f"{value}\n")
+    return value
+
+
+def reservation_path(archive_root: Path, machine_id: str) -> Path:
+    machines = archive_root / ".machines"
+    if machines.is_symlink():
+        raise ValueError(f"Codex machine reservation directory is a symlink: {machines}")
+    machines.mkdir(exist_ok=True)
+    return machines / f"{machine_id}.json"
+
+
+def read_reservation(path: Path) -> str:
+    if path.is_symlink():
+        raise ValueError(f"Codex machine reservation is a symlink: {path}")
+    if not path.is_file():
+        raise ValueError(f"Codex machine reservation is not a file: {path}")
+    try:
+        reservation = json.loads(path.read_text(encoding="utf-8"))
+        value = reservation["installation_id"]
+        if not isinstance(value, str):
+            raise ValueError
+        return str(uuid.UUID(value))
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Codex machine reservation is corrupt: {path}") from error
+
+
+def reserve_machine_id(
+    archive_root: Path,
+    destination_root: Path,
+    machine_id: str,
+    installation: str,
+    claim_existing_machine_id: bool,
+) -> None:
+    if destination_root.is_symlink():
+        raise ValueError(f"Codex session archive destination contains a symlink: {destination_root}")
+    reservation = reservation_path(archive_root, machine_id)
+    if reservation.exists() or reservation.is_symlink():
+        reserved_installation = read_reservation(reservation)
+        if reserved_installation != installation:
+            raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+        return
+
+    if destination_root.exists() and any(destination_root.iterdir()) and not claim_existing_machine_id:
+        raise ValueError(
+            f"Machine ID has an existing archive namespace; rerun with --claim-existing-machine-id: {machine_id}"
+        )
+
+    payload = json.dumps({"installation_id": installation}, sort_keys=True) + "\n"
+    try:
+        descriptor = os.open(reservation, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        reserved_installation = read_reservation(reservation)
+        if reserved_installation != installation:
+            raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+        return
+    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+        destination.write(payload)
+
+
+def publish_sessions(
+    input_path: Path,
+    archive_root: Path,
+    machine_id: str,
+    *,
+    claim_existing_machine_id: bool = False,
+    installation_id_path: Path | None = None,
+) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
     archive_root = archive_root.expanduser().resolve()
@@ -85,6 +175,13 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
 
     archive_root.mkdir(parents=True, exist_ok=True)
+    reserve_machine_id(
+        archive_root,
+        destination_root,
+        machine_id,
+        installation_id(installation_id_path or INSTALLATION_ID_PATH),
+        claim_existing_machine_id,
+    )
     copied = skipped = 0
     for source, relative_path in iter_session_files(source_root):
         destination = destination_root / relative_path
@@ -141,6 +238,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=default_machine_id() is None,
         help="Stable lowercase ID for this Mac",
     )
+    parser.add_argument(
+        "--claim-existing-machine-id",
+        action="store_true",
+        help="Claim a populated legacy namespace that has no reservation",
+    )
     return parser
 
 
@@ -151,7 +253,12 @@ def main(argv: list[str]) -> int:
         if args.archive_root
         else Path(default_shared_input_path()).expanduser()
     )
-    result = publish_sessions(Path(args.input).expanduser(), archive_root, args.machine_id)
+    result = publish_sessions(
+        Path(args.input).expanduser(),
+        archive_root,
+        args.machine_id,
+        claim_existing_machine_id=args.claim_existing_machine_id,
+    )
     print(f"done: copied {result.copied} sessions, skipped {result.skipped} unchanged sessions")
     print(f"shared archive: {result.destination}")
     return 0
