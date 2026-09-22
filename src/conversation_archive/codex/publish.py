@@ -27,6 +27,7 @@ class PublishResult:
     copied: int
     skipped: int
     destination: Path
+    claimed: bool = False
 
 
 def iter_session_files(input_path: Path) -> list[tuple[Path, Path]]:
@@ -145,6 +146,13 @@ def installation_id(path: Path) -> str:
     return installation_id(path)
 
 
+def rotate_installation_id(path: Path) -> None:
+    path = path.expanduser()
+    if path.is_symlink():
+        raise ValueError(f"Codex installation ID is a symlink: {path}")
+    path.unlink(missing_ok=True)
+
+
 def reservation_path(archive_root: Path, machine_id: str) -> Path:
     machines = archive_root / ".machines"
     if machines.is_symlink():
@@ -174,7 +182,7 @@ def reserve_machine_id(
     machine_id: str,
     installation: str,
     claim_existing_machine_id: bool,
-) -> None:
+) -> bool:
     if destination_root.is_symlink():
         raise ValueError(f"Codex session archive destination contains a symlink: {destination_root}")
     reservation = reservation_path(archive_root, machine_id)
@@ -182,13 +190,13 @@ def reserve_machine_id(
         reserved_installation = read_reservation(reservation)
         if reserved_installation != installation:
             raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
-        return
+        return False
 
     if destination_root.exists() and any(destination_root.iterdir()) and not claim_existing_machine_id:
         if reservation.exists() or reservation.is_symlink():
             reserved_installation = read_reservation(reservation)
             if reserved_installation == installation:
-                return
+                return False
             raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
         raise ValueError(
             f"Machine ID has an existing archive namespace; rerun with --claim-existing-machine-id: {machine_id}"
@@ -196,10 +204,11 @@ def reserve_machine_id(
 
     payload = json.dumps({"installation_id": installation}, sort_keys=True) + "\n"
     if atomically_create_file(reservation, payload):
-        return
+        return True
     reserved_installation = read_reservation(reservation)
     if reserved_installation != installation:
         raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+    return False
 
 
 def publish_sessions(
@@ -209,6 +218,7 @@ def publish_sessions(
     *,
     claim_existing_machine_id: bool = False,
     installation_id_path: Path | None = None,
+    wait_for_claim_sync: bool = False,
 ) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
@@ -223,13 +233,15 @@ def publish_sessions(
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
 
     mkdir_durable(archive_root, parents=True)
-    reserve_machine_id(
+    claimed = reserve_machine_id(
         archive_root,
         destination_root,
         machine_id,
         installation_id(installation_id_path or INSTALLATION_ID_PATH),
         claim_existing_machine_id,
     )
+    if claimed and wait_for_claim_sync:
+        return PublishResult(copied=0, skipped=0, destination=destination_root, claimed=True)
     copied = skipped = 0
     for source, relative_path in iter_session_files(source_root):
         destination = destination_root / relative_path
@@ -281,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared Codex-session archive root; defaults to the configured ChatGPT Archive/codex-sessions",
     )
     parser.add_argument(
+        "--rotate-installation-id",
+        action="store_true",
+        help="Generate a new local installation ID before claiming a new machine ID after migration or restore",
+    )
+    parser.add_argument(
         "--machine-id",
         default=default_machine_id(),
         required=default_machine_id() is None,
@@ -301,12 +318,20 @@ def main(argv: list[str]) -> int:
         if args.archive_root
         else Path(default_shared_input_path()).expanduser()
     )
+    installation_path = INSTALLATION_ID_PATH
+    if args.rotate_installation_id:
+        rotate_installation_id(installation_path)
     result = publish_sessions(
         Path(args.input).expanduser(),
         archive_root,
         args.machine_id,
         claim_existing_machine_id=args.claim_existing_machine_id,
+        wait_for_claim_sync=True,
     )
+    if result.claimed:
+        print(f"claimed machine ID: {args.machine_id}")
+        print("wait for shared storage to synchronize, then rerun this command to publish sessions")
+        return 0
     print(f"done: copied {result.copied} sessions, skipped {result.skipped} unchanged sessions")
     print(f"shared archive: {result.destination}")
     return 0

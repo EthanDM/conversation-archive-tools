@@ -87,9 +87,11 @@ conversation-archive-publish-codex --machine-id neo --claim-existing-machine-id
 conversation-archive-index-codex --shared --reset
 ```
 
-By default, the shared archive is `codex-sessions/` beneath the configured ChatGPT Archive root. Override it with `--archive-root` or `CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT`; set `CONVERSATION_ARCHIVE_MACHINE_ID` to avoid passing `--machine-id` each run. The publisher preserves each Mac's namespace, copies only changed `.jsonl` files atomically, and never deletes source or archived files.
+By default, the shared archive is `codex-sessions/` beneath the configured ChatGPT Archive root. Override it with `--archive-root` or `CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT`; set `CONVERSATION_ARCHIVE_MACHINE_ID` to avoid passing `--machine-id` each run. A new claim only creates its reservation and exits; wait for the shared storage to synchronize, then rerun the command to publish. The publisher preserves each Mac's namespace, copies only changed `.jsonl` files atomically, and never deletes source or archived files.
 
 Each Mac also has a private local installation UUID at `~/Library/Application Support/Conversation Archive Tools/installation-id`. Before publishing, it atomically reserves its shared machine ID at `.machines/<machine-id>.json`. A reservation can only be reused by the same installation UUID. Existing populated namespaces created before this safeguard require the explicit one-time `--claim-existing-machine-id` command shown above; the publisher never silently claims them.
+
+After Migration Assistant, a restore, or a clone, choose a new machine ID and run once with `--rotate-installation-id` before claiming it. This generates a new local ownership identity instead of reusing the copied installation ID.
 
 Do not store `codex_sessions.sqlite` in shared storage or symlink `~/.codex/sessions`. The JSONL archive is shared; each Mac's SQLite index stays local.
 

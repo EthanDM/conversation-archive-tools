@@ -210,6 +210,29 @@ class CodexSessionIndexTests(unittest.TestCase):
             self.assertEqual((repeated.copied, repeated.skipped), (0, 1))
             self.assertEqual(json.loads(reservation.read_text(encoding="utf-8"))["installation_id"], first_installation)
 
+    def test_publisher_waits_for_sync_after_a_new_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+
+            claimed = publish_sessions(sessions, archive, "desktop", wait_for_claim_sync=True)
+            published = publish_sessions(sessions, archive, "desktop", wait_for_claim_sync=True)
+
+            self.assertTrue(claimed.claimed)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
+            self.assertFalse(published.claimed)
+            self.assertEqual((published.copied, published.skipped), (1, 0))
+
+    def test_rotating_an_installation_id_generates_a_new_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "installation-id"
+            original = codex_publish.installation_id(path)
+            codex_publish.rotate_installation_id(path)
+
+            self.assertNotEqual(codex_publish.installation_id(path), original)
+
     def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
