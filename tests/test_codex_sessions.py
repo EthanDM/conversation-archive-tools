@@ -172,6 +172,18 @@ class CodexSessionIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Machine ID"):
                 publish_sessions(sessions, root / "archive", "../neo")
 
+    def test_publisher_validates_single_file_input_before_claiming(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "session.txt"
+            source.write_text("not jsonl", encoding="utf-8")
+            archive = root / "archive"
+
+            with self.assertRaisesRegex(ValueError, "not a JSONL file"):
+                publish_sessions(source, archive, "desktop", wait_for_claim_sync=True)
+
+            self.assertFalse((archive / ".machines" / "desktop.json").exists())
+
     def test_atomic_file_creation_preserves_an_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "reservation.json"
@@ -405,6 +417,31 @@ class CodexSessionIndexTests(unittest.TestCase):
                 )
 
         self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_publishes_with_its_own_generated_identity(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ) as publish:
+            self.assertEqual(
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        " desktop ",
+                        "--rotate-installation-id",
+                    ]
+                ),
+                0,
+            )
+
+        self.assertNotEqual(publish.call_args.kwargs["installation"], original)
+        self.assertEqual(publish.call_args.args[2], "desktop")
 
     def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

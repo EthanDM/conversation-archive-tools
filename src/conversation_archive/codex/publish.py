@@ -270,6 +270,7 @@ def publish_sessions(
     *,
     claim_existing_machine_id: bool = False,
     installation_id_path: Path | None = None,
+    installation: str | None = None,
     wait_for_claim_sync: bool = False,
     confirm_claim_sync: bool = False,
 ) -> PublishResult:
@@ -284,19 +285,20 @@ def publish_sessions(
         raise ValueError("Codex session archive destination must not be inside its input directory.")
     if not source_root.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
+    session_files = iter_session_files(source_root)
 
     mkdir_durable(archive_root, parents=True)
     claimed, reservation_existed_at_start = reserve_machine_id(
         archive_root,
         destination_root,
         machine_id,
-        installation_id(installation_id_path or INSTALLATION_ID_PATH),
+        installation or installation_id(installation_id_path or INSTALLATION_ID_PATH),
         claim_existing_machine_id,
     )
     if wait_for_claim_sync and (not reservation_existed_at_start or not confirm_claim_sync):
         return PublishResult(copied=0, skipped=0, destination=destination_root, claimed=True)
     copied = skipped = 0
-    for source, relative_path in iter_session_files(source_root):
+    for source, relative_path in session_files:
         destination = destination_root / relative_path
         ensure_destination_parent(archive_root, destination)
         if destination.is_symlink():
@@ -376,7 +378,7 @@ def main(argv: list[str]) -> int:
         if args.archive_root
         else Path(default_shared_input_path()).expanduser()
     )
-    validate_machine_id(args.machine_id)
+    machine_id = validate_machine_id(args.machine_id)
     installation_path = INSTALLATION_ID_PATH.expanduser()
     previous_installation = existing_installation_id(installation_path) if args.rotate_installation_id else None
     rotated_installation = None
@@ -386,19 +388,20 @@ def main(argv: list[str]) -> int:
         result = publish_sessions(
             Path(args.input).expanduser(),
             archive_root,
-            args.machine_id,
+            machine_id,
             claim_existing_machine_id=args.claim_existing_machine_id,
             wait_for_claim_sync=True,
             confirm_claim_sync=args.confirm_machine_id_sync,
+            installation=rotated_installation,
         )
     except BaseException:
         if args.rotate_installation_id and should_restore_rotated_installation(
-            installation_path, archive_root, args.machine_id, rotated_installation
+            installation_path, archive_root, machine_id, rotated_installation
         ):
             restore_installation_id(installation_path, previous_installation)
         raise
     if result.claimed:
-        print(f"claimed machine ID: {args.machine_id}")
+        print(f"claimed machine ID: {machine_id}")
         print("wait for shared storage to synchronize, then rerun with --confirm-machine-id-sync to publish sessions")
         return 0
     print(f"done: copied {result.copied} sessions, skipped {result.skipped} unchanged sessions")
