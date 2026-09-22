@@ -83,11 +83,14 @@ Keep Codex and every SQLite database local. To search history from multiple Macs
 conversation-archive-publish-codex --machine-id main-mbp --claim-existing-machine-id
 conversation-archive-publish-codex --machine-id neo --claim-existing-machine-id
 
+# After both claims are visible in shared storage, publish from either Mac
+conversation-archive-publish-codex --machine-id main-mbp --confirm-machine-id-sync
+
 # On either Mac, after the shared storage has synchronized
 conversation-archive-index-codex --shared --reset
 ```
 
-By default, the shared archive is `codex-sessions/` beneath the configured ChatGPT Archive root. Override it with `--archive-root` or `CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT`; set `CONVERSATION_ARCHIVE_MACHINE_ID` to avoid passing `--machine-id` each run. A new claim only creates its reservation and exits; wait for the shared storage to synchronize, then rerun the command to publish. The publisher preserves each Mac's namespace, copies only changed `.jsonl` files atomically, and never deletes source or archived files.
+By default, the shared archive is `codex-sessions/` beneath the configured ChatGPT Archive root. Override it with `--archive-root` or `CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT`; set `CONVERSATION_ARCHIVE_MACHINE_ID` to avoid passing `--machine-id` each run. Claims only create reservations; after the shared storage synchronizes, rerun with `--confirm-machine-id-sync` to copy sessions. The publisher preserves each Mac's namespace, copies only changed `.jsonl` files atomically, and never deletes source or archived files.
 
 Each Mac also has a private local installation UUID at `~/Library/Application Support/Conversation Archive Tools/installation-id`. Before publishing, it atomically reserves its shared machine ID at `.machines/<machine-id>.json`. A reservation can only be reused by the same installation UUID. Existing populated namespaces created before this safeguard require the explicit one-time `--claim-existing-machine-id` command shown above; the publisher never silently claims them.
 

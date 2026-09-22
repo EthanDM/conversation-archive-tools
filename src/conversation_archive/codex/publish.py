@@ -153,6 +153,14 @@ def rotate_installation_id(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def restore_installation_id(path: Path, value: str | None) -> None:
+    if value is None:
+        path.unlink(missing_ok=True)
+        return
+    path.unlink(missing_ok=True)
+    atomically_create_file(path, value)
+
+
 def reservation_path(archive_root: Path, machine_id: str) -> Path:
     machines = archive_root / ".machines"
     if machines.is_symlink():
@@ -219,6 +227,7 @@ def publish_sessions(
     claim_existing_machine_id: bool = False,
     installation_id_path: Path | None = None,
     wait_for_claim_sync: bool = False,
+    confirm_claim_sync: bool = False,
 ) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
@@ -240,7 +249,7 @@ def publish_sessions(
         installation_id(installation_id_path or INSTALLATION_ID_PATH),
         claim_existing_machine_id,
     )
-    if claimed and wait_for_claim_sync:
+    if wait_for_claim_sync and not confirm_claim_sync:
         return PublishResult(copied=0, skipped=0, destination=destination_root, claimed=True)
     copied = skipped = 0
     for source, relative_path in iter_session_files(source_root):
@@ -293,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared Codex-session archive root; defaults to the configured ChatGPT Archive/codex-sessions",
     )
     parser.add_argument(
+        "--confirm-machine-id-sync",
+        action="store_true",
+        help="Confirm the reservation is visible to every publisher before copying sessions",
+    )
+    parser.add_argument(
         "--rotate-installation-id",
         action="store_true",
         help="Generate a new local installation ID before claiming a new machine ID after migration or restore",
@@ -318,19 +332,27 @@ def main(argv: list[str]) -> int:
         if args.archive_root
         else Path(default_shared_input_path()).expanduser()
     )
+    validate_machine_id(args.machine_id)
     installation_path = INSTALLATION_ID_PATH
+    previous_installation = installation_path.read_text(encoding="utf-8") if installation_path.exists() else None
     if args.rotate_installation_id:
         rotate_installation_id(installation_path)
-    result = publish_sessions(
-        Path(args.input).expanduser(),
-        archive_root,
-        args.machine_id,
-        claim_existing_machine_id=args.claim_existing_machine_id,
-        wait_for_claim_sync=True,
-    )
+    try:
+        result = publish_sessions(
+            Path(args.input).expanduser(),
+            archive_root,
+            args.machine_id,
+            claim_existing_machine_id=args.claim_existing_machine_id,
+            wait_for_claim_sync=True,
+            confirm_claim_sync=args.confirm_machine_id_sync,
+        )
+    except Exception:
+        if args.rotate_installation_id:
+            restore_installation_id(installation_path, previous_installation)
+        raise
     if result.claimed:
         print(f"claimed machine ID: {args.machine_id}")
-        print("wait for shared storage to synchronize, then rerun this command to publish sessions")
+        print("wait for shared storage to synchronize, then rerun with --confirm-machine-id-sync to publish sessions")
         return 0
     print(f"done: copied {result.copied} sessions, skipped {result.skipped} unchanged sessions")
     print(f"shared archive: {result.destination}")

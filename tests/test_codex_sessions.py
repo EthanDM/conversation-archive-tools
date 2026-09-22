@@ -218,7 +218,13 @@ class CodexSessionIndexTests(unittest.TestCase):
             archive = root / "archive"
 
             claimed = publish_sessions(sessions, archive, "desktop", wait_for_claim_sync=True)
-            published = publish_sessions(sessions, archive, "desktop", wait_for_claim_sync=True)
+            published = publish_sessions(
+                sessions,
+                archive,
+                "desktop",
+                wait_for_claim_sync=True,
+                confirm_claim_sync=True,
+            )
 
             self.assertTrue(claimed.claimed)
             self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
