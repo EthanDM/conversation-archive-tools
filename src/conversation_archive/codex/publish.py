@@ -81,6 +81,20 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def mkdir_durable(path: Path, *, parents: bool = False) -> None:
+    """Create a directory and persist each newly created parent entry."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+        if not parents:
+            break
+    path.mkdir(parents=parents, exist_ok=True)
+    for directory in reversed(missing):
+        fsync_directory(directory.parent)
+
+
 def atomically_create_file(path: Path, contents: str) -> bool:
     """Create a fully written file only when its destination does not exist."""
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -124,7 +138,7 @@ def installation_id(path: Path) -> str:
         except ValueError as error:
             raise ValueError(f"Codex installation ID is invalid: {path}") from error
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_durable(path.parent, parents=True)
     value = str(uuid.uuid4())
     if atomically_create_file(path, f"{value}\n"):
         return value
@@ -135,7 +149,7 @@ def reservation_path(archive_root: Path, machine_id: str) -> Path:
     machines = archive_root / ".machines"
     if machines.is_symlink():
         raise ValueError(f"Codex machine reservation directory is a symlink: {machines}")
-    machines.mkdir(exist_ok=True)
+    mkdir_durable(machines)
     return machines / f"{machine_id}.json"
 
 
@@ -171,6 +185,11 @@ def reserve_machine_id(
         return
 
     if destination_root.exists() and any(destination_root.iterdir()) and not claim_existing_machine_id:
+        if reservation.exists() or reservation.is_symlink():
+            reserved_installation = read_reservation(reservation)
+            if reserved_installation == installation:
+                return
+            raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
         raise ValueError(
             f"Machine ID has an existing archive namespace; rerun with --claim-existing-machine-id: {machine_id}"
         )
@@ -203,7 +222,7 @@ def publish_sessions(
     if not source_root.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
 
-    archive_root.mkdir(parents=True, exist_ok=True)
+    mkdir_durable(archive_root, parents=True)
     reserve_machine_id(
         archive_root,
         destination_root,

@@ -79,11 +79,9 @@ The Codex index retains filtered user and assistant text for search. It excludes
 Keep Codex and every SQLite database local. To search history from multiple Macs, explicitly publish each Mac's JSONL session files into a private shared archive, then build a local index from that archive. This command never uploads data itself; the archive location is a local filesystem path managed by you.
 
 ```bash
-# One-time claim for a populated legacy namespace on the first Mac
+# One-time claim for every populated legacy namespace
 conversation-archive-publish-codex --machine-id main-mbp --claim-existing-machine-id
-
-# On the other Mac
-conversation-archive-publish-codex --machine-id neo
+conversation-archive-publish-codex --machine-id neo --claim-existing-machine-id
 
 # On either Mac, after the shared storage has synchronized
 conversation-archive-index-codex --shared --reset
