@@ -190,6 +190,20 @@ def can_keep_rotated_installation(
         return False
 
 
+def should_restore_rotated_installation(
+    path: Path, archive_root: Path, machine_id: str, installation: str | None
+) -> bool:
+    """Restore only the rotation that still owns the local installation file."""
+    if can_keep_rotated_installation(archive_root, machine_id, installation):
+        return False
+    if installation is None:
+        return True
+    try:
+        return existing_installation_id(path) == installation
+    except (OSError, ValueError):
+        return False
+
+
 def reservation_path(archive_root: Path, machine_id: str) -> Path:
     machines = archive_root / ".machines"
     if machines.is_symlink():
@@ -219,21 +233,22 @@ def reserve_machine_id(
     machine_id: str,
     installation: str,
     claim_existing_machine_id: bool,
-) -> bool:
+) -> tuple[bool, bool]:
     if destination_root.is_symlink():
         raise ValueError(f"Codex session archive destination contains a symlink: {destination_root}")
     reservation = reservation_path(archive_root, machine_id)
-    if reservation.exists() or reservation.is_symlink():
+    reservation_existed_at_start = reservation.exists() or reservation.is_symlink()
+    if reservation_existed_at_start:
         reserved_installation = read_reservation(reservation)
         if reserved_installation != installation:
             raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
-        return False
+        return False, True
 
     if destination_root.exists() and any(destination_root.iterdir()) and not claim_existing_machine_id:
         if reservation.exists() or reservation.is_symlink():
             reserved_installation = read_reservation(reservation)
             if reserved_installation == installation:
-                return False
+                return False, False
             raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
         raise ValueError(
             f"Machine ID has an existing archive namespace; rerun with --claim-existing-machine-id: {machine_id}"
@@ -241,11 +256,11 @@ def reserve_machine_id(
 
     payload = json.dumps({"installation_id": installation}, sort_keys=True) + "\n"
     if atomically_create_file(reservation, payload):
-        return True
+        return True, False
     reserved_installation = read_reservation(reservation)
     if reserved_installation != installation:
         raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
-    return False
+    return False, False
 
 
 def publish_sessions(
@@ -271,14 +286,14 @@ def publish_sessions(
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
 
     mkdir_durable(archive_root, parents=True)
-    claimed = reserve_machine_id(
+    claimed, reservation_existed_at_start = reserve_machine_id(
         archive_root,
         destination_root,
         machine_id,
         installation_id(installation_id_path or INSTALLATION_ID_PATH),
         claim_existing_machine_id,
     )
-    if wait_for_claim_sync and (claimed or not confirm_claim_sync):
+    if wait_for_claim_sync and (not reservation_existed_at_start or not confirm_claim_sync):
         return PublishResult(copied=0, skipped=0, destination=destination_root, claimed=True)
     copied = skipped = 0
     for source, relative_path in iter_session_files(source_root):
@@ -376,9 +391,9 @@ def main(argv: list[str]) -> int:
             wait_for_claim_sync=True,
             confirm_claim_sync=args.confirm_machine_id_sync,
         )
-    except Exception:
-        if args.rotate_installation_id and not can_keep_rotated_installation(
-            archive_root, args.machine_id, rotated_installation
+    except BaseException:
+        if args.rotate_installation_id and should_restore_rotated_installation(
+            installation_path, archive_root, args.machine_id, rotated_installation
         ):
             restore_installation_id(installation_path, previous_installation)
         raise

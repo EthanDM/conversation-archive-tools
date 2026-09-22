@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -250,6 +251,24 @@ class CodexSessionIndexTests(unittest.TestCase):
             self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
             self.assertFalse((archive / "desktop").exists())
 
+    def test_concurrent_first_claim_observer_does_not_publish_with_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+
+            with patch.object(codex_publish, "reserve_machine_id", return_value=(False, False)):
+                claimed = publish_sessions(
+                    sessions,
+                    root / "archive",
+                    "desktop",
+                    wait_for_claim_sync=True,
+                    confirm_claim_sync=True,
+                )
+
+            self.assertTrue(claimed.claimed)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
+
     def test_rotating_an_installation_id_generates_a_new_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "installation-id"
@@ -350,6 +369,40 @@ class CodexSessionIndexTests(unittest.TestCase):
                             "--rotate-installation-id",
                         ]
                     )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_does_not_restore_over_a_concurrent_new_identity(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        rotated = codex_publish.rotate_installation_id(codex_publish.INSTALLATION_ID_PATH)
+        replacement = str(uuid.uuid4())
+        codex_publish.INSTALLATION_ID_PATH.write_text(f"{replacement}\n", encoding="utf-8")
+
+        self.assertFalse(
+            codex_publish.should_restore_rotated_installation(
+                codex_publish.INSTALLATION_ID_PATH,
+                Path("/tmp/archive"),
+                "desktop",
+                rotated,
+            )
+        )
+        self.assertNotEqual(replacement, original)
+
+    def test_rotation_restores_the_old_identity_after_an_interrupt(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with patch.object(codex_publish, "publish_sessions", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
 
         self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
 
