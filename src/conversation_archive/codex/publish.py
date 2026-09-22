@@ -127,6 +127,20 @@ def atomically_create_file(path: Path, contents: str) -> bool:
 def installation_id(path: Path) -> str:
     """Return this installation's persistent UUID without following a symlink."""
     path = path.expanduser()
+    existing = existing_installation_id(path)
+    if existing is not None:
+        return existing
+
+    mkdir_durable(path.parent, parents=True)
+    value = str(uuid.uuid4())
+    if atomically_create_file(path, f"{value}\n"):
+        return value
+    return installation_id(path)
+
+
+def existing_installation_id(path: Path) -> str | None:
+    """Return an existing installation UUID without creating or following one."""
+    path = path.expanduser()
     if path.is_symlink():
         raise ValueError(f"Codex installation ID is a symlink: {path}")
 
@@ -138,19 +152,14 @@ def installation_id(path: Path) -> str:
             return str(uuid.UUID(value))
         except ValueError as error:
             raise ValueError(f"Codex installation ID is invalid: {path}") from error
-
-    mkdir_durable(path.parent, parents=True)
-    value = str(uuid.uuid4())
-    if atomically_create_file(path, f"{value}\n"):
-        return value
-    return installation_id(path)
+    return None
 
 
-def rotate_installation_id(path: Path) -> None:
+def rotate_installation_id(path: Path) -> str:
     path = path.expanduser()
-    if path.is_symlink():
-        raise ValueError(f"Codex installation ID is a symlink: {path}")
+    existing_installation_id(path)
     path.unlink(missing_ok=True)
+    return installation_id(path)
 
 
 def restore_installation_id(path: Path, value: str | None) -> None:
@@ -159,6 +168,14 @@ def restore_installation_id(path: Path, value: str | None) -> None:
         return
     path.unlink(missing_ok=True)
     atomically_create_file(path, value)
+
+
+def reservation_is_owned(archive_root: Path, machine_id: str, installation: str) -> bool:
+    """Return whether an already-created reservation belongs to an installation."""
+    reservation = archive_root / ".machines" / f"{machine_id}.json"
+    if not (reservation.exists() or reservation.is_symlink()):
+        return False
+    return read_reservation(reservation) == installation
 
 
 def reservation_path(archive_root: Path, machine_id: str) -> Path:
@@ -249,7 +266,7 @@ def publish_sessions(
         installation_id(installation_id_path or INSTALLATION_ID_PATH),
         claim_existing_machine_id,
     )
-    if wait_for_claim_sync and not confirm_claim_sync:
+    if wait_for_claim_sync and (claimed or not confirm_claim_sync):
         return PublishResult(copied=0, skipped=0, destination=destination_root, claimed=True)
     copied = skipped = 0
     for source, relative_path in iter_session_files(source_root):
@@ -333,10 +350,11 @@ def main(argv: list[str]) -> int:
         else Path(default_shared_input_path()).expanduser()
     )
     validate_machine_id(args.machine_id)
-    installation_path = INSTALLATION_ID_PATH
-    previous_installation = installation_path.read_text(encoding="utf-8") if installation_path.exists() else None
+    installation_path = INSTALLATION_ID_PATH.expanduser()
+    previous_installation = existing_installation_id(installation_path) if args.rotate_installation_id else None
+    rotated_installation = None
     if args.rotate_installation_id:
-        rotate_installation_id(installation_path)
+        rotated_installation = rotate_installation_id(installation_path)
     try:
         result = publish_sessions(
             Path(args.input).expanduser(),
@@ -347,7 +365,9 @@ def main(argv: list[str]) -> int:
             confirm_claim_sync=args.confirm_machine_id_sync,
         )
     except Exception:
-        if args.rotate_installation_id:
+        if args.rotate_installation_id and not reservation_is_owned(
+            archive_root, args.machine_id, rotated_installation
+        ):
             restore_installation_id(installation_path, previous_installation)
         raise
     if result.claimed:
