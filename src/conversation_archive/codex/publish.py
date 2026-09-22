@@ -178,6 +178,18 @@ def reservation_is_owned(archive_root: Path, machine_id: str, installation: str)
     return read_reservation(reservation) == installation
 
 
+def can_keep_rotated_installation(
+    archive_root: Path, machine_id: str, installation: str | None
+) -> bool:
+    """Keep a rotated ID only when its reservation can be verified safely."""
+    if installation is None:
+        return False
+    try:
+        return reservation_is_owned(archive_root, machine_id, installation)
+    except (OSError, ValueError):
+        return False
+
+
 def reservation_path(archive_root: Path, machine_id: str) -> Path:
     machines = archive_root / ".machines"
     if machines.is_symlink():
@@ -353,9 +365,9 @@ def main(argv: list[str]) -> int:
     installation_path = INSTALLATION_ID_PATH.expanduser()
     previous_installation = existing_installation_id(installation_path) if args.rotate_installation_id else None
     rotated_installation = None
-    if args.rotate_installation_id:
-        rotated_installation = rotate_installation_id(installation_path)
     try:
+        if args.rotate_installation_id:
+            rotated_installation = rotate_installation_id(installation_path)
         result = publish_sessions(
             Path(args.input).expanduser(),
             archive_root,
@@ -365,7 +377,7 @@ def main(argv: list[str]) -> int:
             confirm_claim_sync=args.confirm_machine_id_sync,
         )
     except Exception:
-        if args.rotate_installation_id and not reservation_is_owned(
+        if args.rotate_installation_id and not can_keep_rotated_installation(
             archive_root, args.machine_id, rotated_installation
         ):
             restore_installation_id(installation_path, previous_installation)

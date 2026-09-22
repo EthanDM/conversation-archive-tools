@@ -301,6 +301,58 @@ class CodexSessionIndexTests(unittest.TestCase):
 
             self.assertNotEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
 
+    def test_rotation_restores_the_old_identity_when_creating_the_new_one_fails(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        create_file = codex_publish.atomically_create_file
+
+        def fail_new_identity(path: Path, contents: str) -> bool:
+            if contents.strip() != original:
+                raise OSError("new identity write failed")
+            return create_file(path, contents)
+
+        with patch.object(codex_publish, "atomically_create_file", side_effect=fail_new_identity):
+            with self.assertRaisesRegex(OSError, "new identity write failed"):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_restores_the_old_identity_when_reservation_probe_fails(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "archive"
+
+            def fail_with_corrupt_reservation(*args: object, **kwargs: object) -> codex_publish.PublishResult:
+                reservation = archive / ".machines" / "desktop.json"
+                reservation.parent.mkdir(parents=True)
+                reservation.write_text("not json", encoding="utf-8")
+                raise ValueError("reservation failed")
+
+            with patch.object(codex_publish, "publish_sessions", side_effect=fail_with_corrupt_reservation):
+                with self.assertRaisesRegex(ValueError, "reservation failed"):
+                    codex_publish.main(
+                        [
+                            "--input",
+                            "/tmp/sessions",
+                            "--archive-root",
+                            str(archive),
+                            "--machine-id",
+                            "desktop",
+                            "--rotate-installation-id",
+                        ]
+                    )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
     def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
