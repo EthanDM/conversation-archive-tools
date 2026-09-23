@@ -443,6 +443,30 @@ class CodexSessionIndexTests(unittest.TestCase):
         self.assertNotEqual(publish.call_args.kwargs["installation"], original)
         self.assertEqual(publish.call_args.args[2], "desktop")
 
+    def test_rotation_locks_the_installation_id_until_publishing_finishes(self) -> None:
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ), patch.object(codex_publish.fcntl, "flock") as flock:
+            self.assertEqual(
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                ),
+                0,
+            )
+
+        self.assertEqual(flock.call_args_list[0].args[1], codex_publish.fcntl.LOCK_EX)
+        self.assertEqual(flock.call_args_list[-1].args[1], codex_publish.fcntl.LOCK_UN)
+
     def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import errno
 import filecmp
+import fcntl
 import json
 import os
 import shutil
 import sys
 import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -160,6 +162,20 @@ def rotate_installation_id(path: Path) -> str:
     existing_installation_id(path)
     path.unlink(missing_ok=True)
     return installation_id(path)
+
+
+@contextmanager
+def installation_id_lock(path: Path):
+    """Serialize local installation-ID rotation without a stale lockfile risk."""
+    path = path.expanduser()
+    mkdir_durable(path.parent, parents=True)
+    descriptor = os.open(path.with_name(f".{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def restore_installation_id(path: Path, value: str | None) -> None:
@@ -380,20 +396,23 @@ def main(argv: list[str]) -> int:
     )
     machine_id = validate_machine_id(args.machine_id)
     installation_path = INSTALLATION_ID_PATH.expanduser()
-    previous_installation = existing_installation_id(installation_path) if args.rotate_installation_id else None
+    previous_installation = None
     rotated_installation = None
     try:
-        if args.rotate_installation_id:
-            rotated_installation = rotate_installation_id(installation_path)
-        result = publish_sessions(
-            Path(args.input).expanduser(),
-            archive_root,
-            machine_id,
-            claim_existing_machine_id=args.claim_existing_machine_id,
-            wait_for_claim_sync=True,
-            confirm_claim_sync=args.confirm_machine_id_sync,
-            installation=rotated_installation,
-        )
+        lock = installation_id_lock(installation_path) if args.rotate_installation_id else nullcontext()
+        with lock:
+            if args.rotate_installation_id:
+                previous_installation = existing_installation_id(installation_path)
+                rotated_installation = rotate_installation_id(installation_path)
+            result = publish_sessions(
+                Path(args.input).expanduser(),
+                archive_root,
+                machine_id,
+                claim_existing_machine_id=args.claim_existing_machine_id,
+                wait_for_claim_sync=True,
+                confirm_claim_sync=args.confirm_machine_id_sync,
+                installation=rotated_installation,
+            )
     except BaseException:
         if args.rotate_installation_id and should_restore_rotated_installation(
             installation_path, archive_root, machine_id, rotated_installation
