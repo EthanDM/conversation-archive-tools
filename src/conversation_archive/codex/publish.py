@@ -11,7 +11,7 @@ import os
 import shutil
 import sys
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -165,13 +165,13 @@ def rotate_installation_id(path: Path) -> str:
 
 
 @contextmanager
-def installation_id_lock(path: Path):
-    """Serialize local installation-ID rotation without a stale lockfile risk."""
+def installation_id_lock(path: Path, *, exclusive: bool):
+    """Protect installation-ID reads and rotations without a stale lockfile risk."""
     path = path.expanduser()
     mkdir_durable(path.parent, parents=True)
     descriptor = os.open(path.with_name(f".{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         yield
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -396,13 +396,14 @@ def main(argv: list[str]) -> int:
     )
     machine_id = validate_machine_id(args.machine_id)
     installation_path = INSTALLATION_ID_PATH.expanduser()
-    previous_installation = None
-    rotated_installation = None
-    try:
-        lock = installation_id_lock(installation_path) if args.rotate_installation_id else nullcontext()
-        with lock:
+    with installation_id_lock(installation_path, exclusive=args.rotate_installation_id):
+        previous_installation = None
+        rotated_installation = None
+        rotation_started = False
+        try:
             if args.rotate_installation_id:
                 previous_installation = existing_installation_id(installation_path)
+                rotation_started = True
                 rotated_installation = rotate_installation_id(installation_path)
             result = publish_sessions(
                 Path(args.input).expanduser(),
@@ -413,12 +414,12 @@ def main(argv: list[str]) -> int:
                 confirm_claim_sync=args.confirm_machine_id_sync,
                 installation=rotated_installation,
             )
-    except BaseException:
-        if args.rotate_installation_id and should_restore_rotated_installation(
-            installation_path, archive_root, machine_id, rotated_installation
-        ):
-            restore_installation_id(installation_path, previous_installation)
-        raise
+        except BaseException:
+            if rotation_started and should_restore_rotated_installation(
+                installation_path, archive_root, machine_id, rotated_installation
+            ):
+                restore_installation_id(installation_path, previous_installation)
+            raise
     if result.claimed:
         print(f"claimed machine ID: {machine_id}")
         print("wait for shared storage to synchronize, then rerun with --confirm-machine-id-sync to publish sessions")

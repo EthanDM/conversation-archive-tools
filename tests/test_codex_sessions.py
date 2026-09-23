@@ -467,6 +467,66 @@ class CodexSessionIndexTests(unittest.TestCase):
         self.assertEqual(flock.call_args_list[0].args[1], codex_publish.fcntl.LOCK_EX)
         self.assertEqual(flock.call_args_list[-1].args[1], codex_publish.fcntl.LOCK_UN)
 
+    def test_ordinary_publish_holds_a_shared_installation_id_lock(self) -> None:
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ), patch.object(codex_publish.fcntl, "flock") as flock:
+            self.assertEqual(
+                codex_publish.main(
+                    ["--input", "/tmp/sessions", "--archive-root", "/tmp/archive", "--machine-id", "desktop"]
+                ),
+                0,
+            )
+
+        self.assertEqual(flock.call_args_list[0].args[1], codex_publish.fcntl.LOCK_SH)
+        self.assertEqual(flock.call_args_list[-1].args[1], codex_publish.fcntl.LOCK_UN)
+
+    def test_rotation_lock_failure_does_not_restore_an_unchanged_identity(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with patch.object(codex_publish, "installation_id_lock", side_effect=OSError("lock failed")):
+            with self.assertRaisesRegex(OSError, "lock failed"):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_restores_before_releasing_its_exclusive_lock(self) -> None:
+        lock_modes: list[int] = []
+
+        def restore_while_locked(*args: object) -> None:
+            self.assertEqual(lock_modes[-1], codex_publish.fcntl.LOCK_EX)
+
+        with patch.object(codex_publish, "publish_sessions", side_effect=OSError("publish failed")), patch.object(
+            codex_publish.fcntl,
+            "flock",
+            side_effect=lambda _descriptor, mode: lock_modes.append(mode),
+        ), patch.object(codex_publish, "restore_installation_id", side_effect=restore_while_locked):
+            with self.assertRaisesRegex(OSError, "publish failed"):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(lock_modes[-1], codex_publish.fcntl.LOCK_UN)
+
     def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

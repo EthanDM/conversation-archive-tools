@@ -85,8 +85,11 @@ conversation-archive-publish-codex --machine-id main-mbp --claim-existing-machin
 # On neo: one-time claim for its populated legacy namespace
 conversation-archive-publish-codex --machine-id neo --claim-existing-machine-id
 
-# After both claims are visible in shared storage, publish from either Mac
+# On main-mbp, after both claims are visible in shared storage
 conversation-archive-publish-codex --machine-id main-mbp --confirm-machine-id-sync
+
+# On neo, after both claims are visible in shared storage
+conversation-archive-publish-codex --machine-id neo --confirm-machine-id-sync
 
 # On either Mac, after the shared storage has synchronized
 conversation-archive-index-codex --shared --reset
