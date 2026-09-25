@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import filecmp
+import fcntl
 import json
 import os
 import shutil
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from .paths import (
+    INSTALLATION_ID_PATH,
     default_input_path,
     default_machine_id,
     default_shared_input_path,
@@ -25,6 +29,7 @@ class PublishResult:
     copied: int
     skipped: int
     destination: Path
+    claimed: bool = False
 
 
 def iter_session_files(input_path: Path) -> list[tuple[Path, Path]]:
@@ -71,7 +76,220 @@ def session_id(path: Path) -> str | None:
     return None
 
 
-def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> PublishResult:
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def mkdir_durable(path: Path, *, parents: bool = False) -> None:
+    """Create a directory and persist each newly created parent entry."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+        if not parents:
+            break
+    path.mkdir(parents=parents, exist_ok=True)
+    for directory in reversed(missing):
+        fsync_directory(directory.parent)
+
+
+def atomically_create_file(path: Path, contents: str) -> bool:
+    """Create a fully written file only when its destination does not exist."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    created = False
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            destination.write(contents)
+            destination.flush()
+            os.fsync(destination.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        except OSError as error:
+            if error.errno in {errno.EOPNOTSUPP, errno.EXDEV, errno.EPERM}:
+                raise ValueError(
+                    f"Atomic Codex ownership records require hard-link support: {path.parent}"
+                ) from error
+            raise
+        created = True
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+        if created:
+            fsync_directory(path.parent)
+
+
+def installation_id(path: Path) -> str:
+    """Return this installation's persistent UUID without following a symlink."""
+    path = path.expanduser()
+    existing = existing_installation_id(path)
+    if existing is not None:
+        return existing
+
+    mkdir_durable(path.parent, parents=True)
+    value = str(uuid.uuid4())
+    if atomically_create_file(path, f"{value}\n"):
+        return value
+    return installation_id(path)
+
+
+def existing_installation_id(path: Path) -> str | None:
+    """Return an existing installation UUID without creating or following one."""
+    path = path.expanduser()
+    if path.is_symlink():
+        raise ValueError(f"Codex installation ID is a symlink: {path}")
+
+    if path.exists():
+        if not path.is_file():
+            raise ValueError(f"Codex installation ID is not a file: {path}")
+        value = path.read_text(encoding="utf-8").strip()
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as error:
+            raise ValueError(f"Codex installation ID is invalid: {path}") from error
+    return None
+
+
+def rotate_installation_id(path: Path) -> str:
+    path = path.expanduser()
+    existing_installation_id(path)
+    path.unlink(missing_ok=True)
+    return installation_id(path)
+
+
+@contextmanager
+def installation_id_lock(path: Path, *, exclusive: bool):
+    """Protect installation-ID reads and rotations without a stale lockfile risk."""
+    path = path.expanduser()
+    mkdir_durable(path.parent, parents=True)
+    descriptor = os.open(path.with_name(f".{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def restore_installation_id(path: Path, value: str | None) -> None:
+    if value is None:
+        path.unlink(missing_ok=True)
+        return
+    path.unlink(missing_ok=True)
+    atomically_create_file(path, value)
+
+
+def reservation_is_owned(archive_root: Path, machine_id: str, installation: str) -> bool:
+    """Return whether an already-created reservation belongs to an installation."""
+    reservation = archive_root / ".machines" / f"{machine_id}.json"
+    if not (reservation.exists() or reservation.is_symlink()):
+        return False
+    return read_reservation(reservation) == installation
+
+
+def can_keep_rotated_installation(
+    archive_root: Path, machine_id: str, installation: str | None
+) -> bool:
+    """Keep a rotated ID only when its reservation can be verified safely."""
+    if installation is None:
+        return False
+    try:
+        return reservation_is_owned(archive_root, machine_id, installation)
+    except (OSError, ValueError):
+        return False
+
+
+def should_restore_rotated_installation(
+    path: Path, archive_root: Path, machine_id: str, installation: str | None
+) -> bool:
+    """Restore only the rotation that still owns the local installation file."""
+    if can_keep_rotated_installation(archive_root, machine_id, installation):
+        return False
+    if installation is None:
+        return True
+    try:
+        return existing_installation_id(path) == installation
+    except (OSError, ValueError):
+        return False
+
+
+def reservation_path(archive_root: Path, machine_id: str) -> Path:
+    machines = archive_root / ".machines"
+    if machines.is_symlink():
+        raise ValueError(f"Codex machine reservation directory is a symlink: {machines}")
+    mkdir_durable(machines)
+    return machines / f"{machine_id}.json"
+
+
+def read_reservation(path: Path) -> str:
+    if path.is_symlink():
+        raise ValueError(f"Codex machine reservation is a symlink: {path}")
+    if not path.is_file():
+        raise ValueError(f"Codex machine reservation is not a file: {path}")
+    try:
+        reservation = json.loads(path.read_text(encoding="utf-8"))
+        value = reservation["installation_id"]
+        if not isinstance(value, str):
+            raise ValueError
+        return str(uuid.UUID(value))
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Codex machine reservation is corrupt: {path}") from error
+
+
+def reserve_machine_id(
+    archive_root: Path,
+    destination_root: Path,
+    machine_id: str,
+    installation: str,
+    claim_existing_machine_id: bool,
+) -> tuple[bool, bool]:
+    if destination_root.is_symlink():
+        raise ValueError(f"Codex session archive destination contains a symlink: {destination_root}")
+    reservation = reservation_path(archive_root, machine_id)
+    reservation_existed_at_start = reservation.exists() or reservation.is_symlink()
+    if reservation_existed_at_start:
+        reserved_installation = read_reservation(reservation)
+        if reserved_installation != installation:
+            raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+        return False, True
+
+    if destination_root.exists() and any(destination_root.iterdir()) and not claim_existing_machine_id:
+        if reservation.exists() or reservation.is_symlink():
+            reserved_installation = read_reservation(reservation)
+            if reserved_installation == installation:
+                return False, False
+            raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+        raise ValueError(
+            f"Machine ID has an existing archive namespace; rerun with --claim-existing-machine-id: {machine_id}"
+        )
+
+    payload = json.dumps({"installation_id": installation}, sort_keys=True) + "\n"
+    if atomically_create_file(reservation, payload):
+        return True, False
+    reserved_installation = read_reservation(reservation)
+    if reserved_installation != installation:
+        raise ValueError(f"Machine ID is already reserved by another installation: {machine_id}")
+    return False, False
+
+
+def publish_sessions(
+    input_path: Path,
+    archive_root: Path,
+    machine_id: str,
+    *,
+    claim_existing_machine_id: bool = False,
+    installation_id_path: Path | None = None,
+    installation: str | None = None,
+    wait_for_claim_sync: bool = False,
+    confirm_claim_sync: bool = False,
+) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
     archive_root = archive_root.expanduser().resolve()
@@ -83,10 +301,20 @@ def publish_sessions(input_path: Path, archive_root: Path, machine_id: str) -> P
         raise ValueError("Codex session archive destination must not be inside its input directory.")
     if not source_root.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
+    session_files = iter_session_files(source_root)
 
-    archive_root.mkdir(parents=True, exist_ok=True)
+    mkdir_durable(archive_root, parents=True)
+    claimed, reservation_existed_at_start = reserve_machine_id(
+        archive_root,
+        destination_root,
+        machine_id,
+        installation or installation_id(installation_id_path or INSTALLATION_ID_PATH),
+        claim_existing_machine_id,
+    )
+    if wait_for_claim_sync and (not reservation_existed_at_start or not confirm_claim_sync):
+        return PublishResult(copied=0, skipped=0, destination=destination_root, claimed=True)
     copied = skipped = 0
-    for source, relative_path in iter_session_files(source_root):
+    for source, relative_path in session_files:
         destination = destination_root / relative_path
         ensure_destination_parent(archive_root, destination)
         if destination.is_symlink():
@@ -136,10 +364,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared Codex-session archive root; defaults to the configured ChatGPT Archive/codex-sessions",
     )
     parser.add_argument(
+        "--confirm-machine-id-sync",
+        action="store_true",
+        help="Confirm the reservation is visible to every publisher before copying sessions",
+    )
+    parser.add_argument(
+        "--rotate-installation-id",
+        action="store_true",
+        help="Generate a new local installation ID before claiming a new machine ID after migration or restore",
+    )
+    parser.add_argument(
         "--machine-id",
         default=default_machine_id(),
         required=default_machine_id() is None,
         help="Stable lowercase ID for this Mac",
+    )
+    parser.add_argument(
+        "--claim-existing-machine-id",
+        action="store_true",
+        help="Claim a populated legacy namespace that has no reservation",
     )
     return parser
 
@@ -151,7 +394,36 @@ def main(argv: list[str]) -> int:
         if args.archive_root
         else Path(default_shared_input_path()).expanduser()
     )
-    result = publish_sessions(Path(args.input).expanduser(), archive_root, args.machine_id)
+    machine_id = validate_machine_id(args.machine_id)
+    installation_path = INSTALLATION_ID_PATH.expanduser()
+    with installation_id_lock(installation_path, exclusive=args.rotate_installation_id):
+        previous_installation = None
+        rotated_installation = None
+        rotation_started = False
+        try:
+            if args.rotate_installation_id:
+                previous_installation = existing_installation_id(installation_path)
+                rotation_started = True
+                rotated_installation = rotate_installation_id(installation_path)
+            result = publish_sessions(
+                Path(args.input).expanduser(),
+                archive_root,
+                machine_id,
+                claim_existing_machine_id=args.claim_existing_machine_id,
+                wait_for_claim_sync=True,
+                confirm_claim_sync=args.confirm_machine_id_sync,
+                installation=rotated_installation,
+            )
+        except BaseException:
+            if rotation_started and should_restore_rotated_installation(
+                installation_path, archive_root, machine_id, rotated_installation
+            ):
+                restore_installation_id(installation_path, previous_installation)
+            raise
+    if result.claimed:
+        print(f"claimed machine ID: {machine_id}")
+        print("wait for shared storage to synchronize, then rerun with --confirm-machine-id-sync to publish sessions")
+        return 0
     print(f"done: copied {result.copied} sessions, skipped {result.skipped} unchanged sessions")
     print(f"shared archive: {result.destination}")
     return 0

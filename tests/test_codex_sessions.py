@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import errno
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +18,7 @@ sys.path.insert(0, str(SOURCE_DIR))
 
 from conversation_archive.codex.context_candidates import build_candidates, load_rules
 from conversation_archive.codex import index as codex_index
+from conversation_archive.codex import publish as codex_publish
 from conversation_archive.codex import session_index
 from conversation_archive.codex.publish import publish_sessions
 from conversation_archive.codex.search import search
@@ -32,6 +35,19 @@ def message(role: str, text: str, timestamp: str = "2026-08-12T12:01:00Z") -> st
 
 
 class CodexSessionIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.installation_directory = tempfile.TemporaryDirectory()
+        self.installation_patch = patch.object(
+            codex_publish,
+            "INSTALLATION_ID_PATH",
+            Path(self.installation_directory.name) / "installation-id",
+        )
+        self.installation_patch.start()
+
+    def tearDown(self) -> None:
+        self.installation_patch.stop()
+        self.installation_directory.cleanup()
+
     def write_fixture(self, directory: Path, name: str = "session.jsonl") -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / name
@@ -156,6 +172,429 @@ class CodexSessionIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Machine ID"):
                 publish_sessions(sessions, root / "archive", "../neo")
 
+    def test_publisher_validates_single_file_input_before_claiming(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "session.txt"
+            source.write_text("not jsonl", encoding="utf-8")
+            archive = root / "archive"
+
+            with self.assertRaisesRegex(ValueError, "not a JSONL file"):
+                publish_sessions(source, archive, "desktop", wait_for_claim_sync=True)
+
+            self.assertFalse((archive / ".machines" / "desktop.json").exists())
+
+    def test_atomic_file_creation_preserves_an_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            path.write_text("existing\n", encoding="utf-8")
+
+            self.assertFalse(codex_publish.atomically_create_file(path, "replacement\n"))
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing\n")
+
+    def test_atomic_file_creation_syncs_the_published_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            with patch.object(codex_publish, "fsync_directory") as fsync_directory:
+                self.assertTrue(codex_publish.atomically_create_file(path, "contents\n"))
+            fsync_directory.assert_called_once_with(path.parent)
+
+    def test_atomic_file_creation_requires_hard_link_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reservation.json"
+            with patch.object(codex_publish.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")):
+                with self.assertRaisesRegex(ValueError, "require hard-link support"):
+                    codex_publish.atomically_create_file(path, "contents\n")
+            self.assertFalse(path.exists())
+
+    def test_publisher_reserves_a_new_machine_id_and_reuses_its_own_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+
+            first = publish_sessions(sessions, archive, "desktop")
+            reservation = archive / ".machines" / "desktop.json"
+            first_installation = json.loads(reservation.read_text(encoding="utf-8"))["installation_id"]
+            repeated = publish_sessions(sessions, archive, "desktop")
+
+            self.assertEqual((first.copied, first.skipped), (1, 0))
+            self.assertEqual((repeated.copied, repeated.skipped), (0, 1))
+            self.assertEqual(json.loads(reservation.read_text(encoding="utf-8"))["installation_id"], first_installation)
+
+    def test_publisher_waits_for_sync_after_a_new_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+
+            claimed = publish_sessions(sessions, archive, "desktop", wait_for_claim_sync=True)
+            published = publish_sessions(
+                sessions,
+                archive,
+                "desktop",
+                wait_for_claim_sync=True,
+                confirm_claim_sync=True,
+            )
+
+            self.assertTrue(claimed.claimed)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
+            self.assertFalse(published.claimed)
+            self.assertEqual((published.copied, published.skipped), (1, 0))
+
+    def test_confirmation_does_not_publish_during_the_claiming_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+
+            claimed = publish_sessions(
+                sessions,
+                archive,
+                "desktop",
+                wait_for_claim_sync=True,
+                confirm_claim_sync=True,
+            )
+
+            self.assertTrue(claimed.claimed)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
+            self.assertFalse((archive / "desktop").exists())
+
+    def test_concurrent_first_claim_observer_does_not_publish_with_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+
+            with patch.object(codex_publish, "reserve_machine_id", return_value=(False, False)):
+                claimed = publish_sessions(
+                    sessions,
+                    root / "archive",
+                    "desktop",
+                    wait_for_claim_sync=True,
+                    confirm_claim_sync=True,
+                )
+
+            self.assertTrue(claimed.claimed)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 0))
+
+    def test_rotating_an_installation_id_generates_a_new_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "installation-id"
+            original = codex_publish.installation_id(path)
+            codex_publish.rotate_installation_id(path)
+
+            self.assertNotEqual(codex_publish.installation_id(path), original)
+
+    def test_cli_does_not_read_an_installation_id_without_rotation(self) -> None:
+        target = Path(self.installation_directory.name) / "target"
+        codex_publish.INSTALLATION_ID_PATH.symlink_to(target)
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ):
+            self.assertEqual(
+                codex_publish.main(
+                    ["--input", "/tmp/sessions", "--archive-root", "/tmp/archive", "--machine-id", "desktop"]
+                ),
+                0,
+            )
+
+    def test_rotation_retains_new_identity_after_a_reservation_is_created(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "archive"
+
+            def fail_after_claim(*args: object, **kwargs: object) -> codex_publish.PublishResult:
+                installation = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+                reservation = archive / ".machines" / "desktop.json"
+                reservation.parent.mkdir(parents=True)
+                reservation.write_text(json.dumps({"installation_id": installation}), encoding="utf-8")
+                raise OSError("copy failed")
+
+            with patch.object(codex_publish, "publish_sessions", side_effect=fail_after_claim):
+                with self.assertRaisesRegex(OSError, "copy failed"):
+                    codex_publish.main(
+                        [
+                            "--input",
+                            "/tmp/sessions",
+                            "--archive-root",
+                            str(archive),
+                            "--machine-id",
+                            "desktop",
+                            "--rotate-installation-id",
+                        ]
+                    )
+
+            self.assertNotEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_restores_the_old_identity_when_creating_the_new_one_fails(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        create_file = codex_publish.atomically_create_file
+
+        def fail_new_identity(path: Path, contents: str) -> bool:
+            if contents.strip() != original:
+                raise OSError("new identity write failed")
+            return create_file(path, contents)
+
+        with patch.object(codex_publish, "atomically_create_file", side_effect=fail_new_identity):
+            with self.assertRaisesRegex(OSError, "new identity write failed"):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_restores_the_old_identity_when_reservation_probe_fails(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "archive"
+
+            def fail_with_corrupt_reservation(*args: object, **kwargs: object) -> codex_publish.PublishResult:
+                reservation = archive / ".machines" / "desktop.json"
+                reservation.parent.mkdir(parents=True)
+                reservation.write_text("not json", encoding="utf-8")
+                raise ValueError("reservation failed")
+
+            with patch.object(codex_publish, "publish_sessions", side_effect=fail_with_corrupt_reservation):
+                with self.assertRaisesRegex(ValueError, "reservation failed"):
+                    codex_publish.main(
+                        [
+                            "--input",
+                            "/tmp/sessions",
+                            "--archive-root",
+                            str(archive),
+                            "--machine-id",
+                            "desktop",
+                            "--rotate-installation-id",
+                        ]
+                    )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_does_not_restore_over_a_concurrent_new_identity(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        rotated = codex_publish.rotate_installation_id(codex_publish.INSTALLATION_ID_PATH)
+        replacement = str(uuid.uuid4())
+        codex_publish.INSTALLATION_ID_PATH.write_text(f"{replacement}\n", encoding="utf-8")
+
+        self.assertFalse(
+            codex_publish.should_restore_rotated_installation(
+                codex_publish.INSTALLATION_ID_PATH,
+                Path("/tmp/archive"),
+                "desktop",
+                rotated,
+            )
+        )
+        self.assertNotEqual(replacement, original)
+
+    def test_rotation_restores_the_old_identity_after_an_interrupt(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with patch.object(codex_publish, "publish_sessions", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_publishes_with_its_own_generated_identity(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ) as publish:
+            self.assertEqual(
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        " desktop ",
+                        "--rotate-installation-id",
+                    ]
+                ),
+                0,
+            )
+
+        self.assertNotEqual(publish.call_args.kwargs["installation"], original)
+        self.assertEqual(publish.call_args.args[2], "desktop")
+
+    def test_rotation_locks_the_installation_id_until_publishing_finishes(self) -> None:
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ), patch.object(codex_publish.fcntl, "flock") as flock:
+            self.assertEqual(
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                ),
+                0,
+            )
+
+        self.assertEqual(flock.call_args_list[0].args[1], codex_publish.fcntl.LOCK_EX)
+        self.assertEqual(flock.call_args_list[-1].args[1], codex_publish.fcntl.LOCK_UN)
+
+    def test_ordinary_publish_holds_a_shared_installation_id_lock(self) -> None:
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ), patch.object(codex_publish.fcntl, "flock") as flock:
+            self.assertEqual(
+                codex_publish.main(
+                    ["--input", "/tmp/sessions", "--archive-root", "/tmp/archive", "--machine-id", "desktop"]
+                ),
+                0,
+            )
+
+        self.assertEqual(flock.call_args_list[0].args[1], codex_publish.fcntl.LOCK_SH)
+        self.assertEqual(flock.call_args_list[-1].args[1], codex_publish.fcntl.LOCK_UN)
+
+    def test_rotation_lock_failure_does_not_restore_an_unchanged_identity(self) -> None:
+        original = codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH)
+        with patch.object(codex_publish, "installation_id_lock", side_effect=OSError("lock failed")):
+            with self.assertRaisesRegex(OSError, "lock failed"):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(codex_publish.installation_id(codex_publish.INSTALLATION_ID_PATH), original)
+
+    def test_rotation_restores_before_releasing_its_exclusive_lock(self) -> None:
+        lock_modes: list[int] = []
+
+        def restore_while_locked(*args: object) -> None:
+            self.assertEqual(lock_modes[-1], codex_publish.fcntl.LOCK_EX)
+
+        with patch.object(codex_publish, "publish_sessions", side_effect=OSError("publish failed")), patch.object(
+            codex_publish.fcntl,
+            "flock",
+            side_effect=lambda _descriptor, mode: lock_modes.append(mode),
+        ), patch.object(codex_publish, "restore_installation_id", side_effect=restore_while_locked):
+            with self.assertRaisesRegex(OSError, "publish failed"):
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--rotate-installation-id",
+                    ]
+                )
+
+        self.assertEqual(lock_modes[-1], codex_publish.fcntl.LOCK_UN)
+
+    def test_publisher_rejects_a_machine_id_reserved_by_another_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+            publish_sessions(sessions, archive, "desktop", installation_id_path=root / "first-id")
+
+            with self.assertRaisesRegex(ValueError, "already reserved"):
+                publish_sessions(sessions, archive, "desktop", installation_id_path=root / "second-id")
+
+    def test_publisher_requires_an_explicit_claim_for_a_populated_legacy_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+            self.write_fixture(archive / "desktop")
+
+            with self.assertRaisesRegex(ValueError, "claim-existing-machine-id"):
+                publish_sessions(sessions, archive, "desktop")
+            self.assertFalse((archive / ".machines" / "desktop.json").exists())
+
+            claimed = publish_sessions(sessions, archive, "desktop", claim_existing_machine_id=True)
+            self.assertEqual((claimed.copied, claimed.skipped), (0, 1))
+            self.assertTrue((archive / ".machines" / "desktop.json").is_file())
+
+    def test_publisher_rejects_symlinked_or_corrupt_machine_reservations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            self.write_fixture(sessions)
+            archive = root / "archive"
+            reservation = archive / ".machines" / "desktop.json"
+            reservation.parent.mkdir(parents=True)
+            reservation.symlink_to(root / "outside.json")
+
+            with self.assertRaisesRegex(ValueError, "reservation is a symlink"):
+                publish_sessions(sessions, archive, "desktop")
+
+            reservation.unlink()
+            reservation.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reservation is corrupt"):
+                publish_sessions(sessions, archive, "desktop")
+
+    def test_publisher_cli_exposes_and_passes_the_legacy_claim_flag(self) -> None:
+        self.assertIn("--claim-existing-machine-id", codex_publish.build_parser().format_help())
+        with patch.object(
+            codex_publish,
+            "publish_sessions",
+            return_value=codex_publish.PublishResult(0, 0, Path("/tmp/archive/desktop")),
+        ) as publish:
+            self.assertEqual(
+                codex_publish.main(
+                    [
+                        "--input",
+                        "/tmp/sessions",
+                        "--archive-root",
+                        "/tmp/archive",
+                        "--machine-id",
+                        "desktop",
+                        "--claim-existing-machine-id",
+                    ]
+                ),
+                0,
+            )
+        self.assertTrue(publish.call_args.kwargs["claim_existing_machine_id"])
+
     def test_publisher_rejects_an_archive_inside_the_source_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -230,7 +669,7 @@ class CodexSessionIndexTests(unittest.TestCase):
             destination.parent.mkdir(parents=True)
             destination.symlink_to(source)
             with self.assertRaisesRegex(ValueError, "destination is a symlink"):
-                publish_sessions(sessions, archive, "desktop")
+                publish_sessions(sessions, archive, "desktop", claim_existing_machine_id=True)
 
     def test_publisher_rejects_conflicting_single_file_destinations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

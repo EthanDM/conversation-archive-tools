@@ -10,6 +10,7 @@ from ..chatgpt.paths import configured_archive_root
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "Conversation Archive Tools"
 DEFAULT_INPUT_PATH = Path.home() / ".codex" / "sessions"
 DEFAULT_DB_PATH = APP_SUPPORT_DIR / "codex_sessions.sqlite"
+INSTALLATION_ID_PATH = APP_SUPPORT_DIR / "installation-id"
 MACHINE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
