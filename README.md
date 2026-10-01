@@ -2,11 +2,12 @@
 
 Local-first tools for indexing, searching, and reviewing AI conversation archives.
 
-The project indexes official ChatGPT exports and local Codex sessions into separate SQLite FTS5 databases. Everything stays on your machine: the tools do not upload conversations, connect to a hosted service, or write to ChatGPT memory.
+The project indexes official ChatGPT and Claude exports and local Codex sessions into separate SQLite FTS5 databases. Everything stays on your machine: the tools do not upload conversations, connect to a hosted service, or write to ChatGPT memory.
 
 ## What it supports
 
 - Official ChatGPT exports in either `conversations.json` or sharded `conversations-*.json` form.
+- Claude conversation JSON, ZIP, and multipart export snapshots.
 - Local Codex JSONL sessions from `~/.codex/sessions`.
 - Full-text search, source-linked transcripts, topic reports, and local reflection indexes.
 - Conservative Codex context-candidate reports: candidates require user-message evidence and are flagged for sensitive or operational material before review.
@@ -55,6 +56,33 @@ The indexer accepts either an extracted export directory or the downloaded ZIP d
 ```
 
 You can instead pass `--input` and `--db` directly to `conversation-archive-index-chatgpt` for a one-off index. The configured paths may also be overridden with `CHATGPT_EXPORT_INPUT`, `CHATGPT_EXPORT_DB`, and `CHATGPT_EXPORT_CONFIG`.
+
+## Claude export quick start
+
+```bash
+conversation-archive-index-claude --input /path/to/Claude-Archive/exports/full/YYYY-MM-DD
+conversation-archive-search-claude '"project planning"' --role user --context 2
+conversation-archive-show-claude --title "project planning" --list
+conversation-archive-show-claude --conv <conversation-uuid>
+```
+
+Input may be a conversations ZIP, JSON file, or export directory. Directory discovery prefers
+`extracted/conversations.json`, then `conversations.json`, then all `conversations-*.zip`
+parts. Each import replaces the previous Claude snapshot transactionally. Invalid imports
+leave the previous index intact; databases from other providers are refused.
+
+The separate database defaults to
+`~/Library/Application Support/Conversation Archive Tools/claude.sqlite`.
+Use `CLAUDE_EXPORT_INPUT` and `CLAUDE_EXPORT_DB` for defaults; explicit `--input` and
+`--db` take precedence. Input is required unless the environment supplies it.
+
+Only user and assistant text is indexed. Structured text blocks take precedence over
+legacy text fields. Thinking, tool payloads, attachment contents, account metadata,
+project documents, saved memories, and generated summaries are excluded. Attachment
+names appear as references, without implying that files are available. Transcripts
+retain exported order and parent UUIDs and display every exported message, rather than
+inferring a selected branch. `--max-chars` truncates each displayed message.
+Search and transcript commands read existing databases without creating or changing them.
 
 ## Codex session quick start
 
