@@ -17,6 +17,9 @@ classifiers = [
 ]
 
 [project.scripts]
+conversation-archive-index-claude = "conversation_archive.entrypoints:index_claude"
+conversation-archive-search-claude = "conversation_archive.entrypoints:search_claude"
+conversation-archive-show-claude = "conversation_archive.entrypoints:show_claude"
 conversation-archive-configure = "conversation_archive.entrypoints:configure"
 conversation-archive-audit = "conversation_archive.entrypoints:audit_chatgpt"
 conversation-archive-handoff = "conversation_archive.entrypoints:handoff_chatgpt"

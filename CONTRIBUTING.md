@@ -2,7 +2,7 @@
 
 ## Scope
 
-`conversation-archive-tools` is a local-first CLI for reviewing ChatGPT exports and Codex sessions. Keep changes small, explicit, and dependency-free unless a dependency clearly improves the supported core.
+`conversation-archive-tools` is a local-first CLI for reviewing ChatGPT and Claude exports and Codex sessions. Keep changes small, explicit, and dependency-free unless a dependency clearly improves the supported core.
 
 The supported core is indexing, search, transcript display, context review, and the optional local dashboard. Files under `src/conversation_archive/experimental/` are useful local analysis scripts, not a stable product surface.
 
@@ -27,6 +27,9 @@ python3 -m compileall -q src
 python3 -m pip install .
 conversation-archive-index-chatgpt --help
 conversation-archive-index-codex --help
+conversation-archive-index-claude --help
+conversation-archive-search-claude --help
+conversation-archive-show-claude --help
 git diff --check
 ```
 
@@ -38,7 +41,7 @@ The release audit checks tracked files and unignored additions for common runtim
 
 ## Change guidelines
 
-- Preserve the separation between ChatGPT and Codex indexes.
+- Preserve the separation between ChatGPT, Claude, and Codex indexes.
 - Keep all storage and serving local by default; do not add automatic transmission or memory synchronization.
 - Update tests with behavior changes, and update `README.md` when setup, commands, privacy behavior, or supported scope changes.
 - Prefer conventional commits where practical, such as `feat(index): ...`, `fix(audit): ...`, or `chore(ci): ...`.

@@ -30,3 +30,6 @@ jobs:
           python -m pip install .
           conversation-archive-index-chatgpt --help
           conversation-archive-index-codex --help
+          conversation-archive-index-claude --help
+          conversation-archive-search-claude --help
+          conversation-archive-show-claude --help

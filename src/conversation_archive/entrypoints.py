@@ -3,6 +3,9 @@ from __future__ import annotations
 import sys
 from typing import Callable
 
+from .claude.index import main as index_claude_main
+from .claude.search import main as search_claude_main
+from .claude.show import main as show_claude_main
 from .chatgpt.configure import main as configure_main
 from .chatgpt.audit import main as audit_chatgpt_main
 from .chatgpt.handoff import main as handoff_chatgpt_main
@@ -87,3 +90,15 @@ def build_reflection_indexes() -> int:
 
 def serve() -> int:
     return _run(serve_main)
+
+
+def index_claude() -> int:
+    return _run(index_claude_main)
+
+
+def search_claude() -> int:
+    return _run(search_claude_main)
+
+
+def show_claude() -> int:
+    return _run(show_claude_main)
