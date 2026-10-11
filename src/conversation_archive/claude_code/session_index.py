@@ -90,15 +90,19 @@ def parse_session_file(path: Path) -> dict | None:
 
     Tool-result user records and messages marked as metadata, compaction
     summaries, system-origin prompts, or task notifications do not represent
-    conversation text.
+    conversation text. An identified, fully parsed session may contain no retained
+    messages; None means the file did not contain enough valid data to update safely.
     """
     session_ids, cwd, title = [], "", ""
+    saw_message_event = False
+    has_malformed_line = False
     messages, seen = [], set()
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                has_malformed_line = True
                 continue
             if not isinstance(event, dict):
                 continue
@@ -111,12 +115,14 @@ def parse_session_file(path: Path) -> dict | None:
             if event.get("type") == "custom-title" and isinstance(event.get("customTitle"), str):
                 title = event["customTitle"]
             role = event.get("type")
+            message = event.get("message")
+            if role in {"user", "assistant"} and isinstance(message, dict):
+                saw_message_event = True
             if (role not in {"user", "assistant"} or event.get("isMeta")
                     or event.get("isCompactSummary") or event.get("promptSource") == "system"
                     or (isinstance(event.get("origin"), dict)
                         and event["origin"].get("kind") == "task-notification")):
                 continue
-            message = event.get("message")
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
@@ -136,7 +142,7 @@ def parse_session_file(path: Path) -> dict | None:
             parent = event.get("parentUuid")
             messages.append((role, timestamp if isinstance(timestamp, str) else None, text,
                              uuid, parent if isinstance(parent, str) else None, bool(event.get("isSidechain"))))
-    if not session_ids or not messages:
+    if not session_ids or (not messages and (not saw_message_event or has_malformed_line)):
         return None
     session_id = _session_stream_id(path, session_ids)
     title = title or next((m[2] for m in messages if m[0] == "user"), f"Claude Code session {session_id}")
@@ -183,6 +189,10 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
             if session is None:
                 continue
             session_id, messages = session["session_id"], session["messages"]
+            if not messages:
+                with connection:
+                    connection.execute("DELETE FROM sessions WHERE source_path=?", (str(path),))
+                continue
             owner = connection.execute("SELECT source_path FROM sessions WHERE session_id=?", (session_id,)).fetchone()
             if owner and owner[0] != str(path):
                 raise ValueError(f"Duplicate session ID in different source files: {session_id}")

@@ -88,6 +88,37 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
                 "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'machinegeneratedstatus'"
             ).fetchone()[0], 0)
 
+    def test_filtered_empty_transcript_removes_previous_index(self):
+        for incremental in (True, False):
+            with self.subTest(incremental=incremental):
+                db = self.root / f'filtered-{incremental}.sqlite'
+                self.write([self.event('old', content='oldsearchterm')])
+                self.assertEqual(index_sessions(self.source, db), (1, 0, 1))
+                notification = self.event('notification', content='machine status',
+                                          origin={'kind': 'task-notification'})
+                self.source.write_text(json.dumps(notification) + '\n')
+                self.assertEqual(index_sessions(self.source, db, incremental=incremental),
+                                 (0, 0, 0))
+                with contextlib.closing(connect_readonly(db)) as connection:
+                    self.assertEqual(connection.execute('SELECT count(*) FROM sessions').fetchone()[0], 0)
+                    self.assertEqual(connection.execute('SELECT count(*) FROM messages').fetchone()[0], 0)
+                    self.assertEqual(connection.execute(
+                        "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'oldsearchterm'"
+                    ).fetchone()[0], 0)
+
+    def test_incomplete_filtered_transcript_preserves_previous_index(self):
+        self.write([self.event('old', content='oldsearchterm')])
+        self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
+        notification = self.event('notification', content='machine status',
+                                  origin={'kind': 'task-notification'})
+        self.source.write_text(json.dumps(notification) + '\n{"partial":')
+        self.assertEqual(index_sessions(self.source, self.db, incremental=False), (0, 0, 1))
+        with contextlib.closing(connect_readonly(self.db)) as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM sessions').fetchone()[0], 1)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'oldsearchterm'"
+            ).fetchone()[0], 1)
+
     def test_subagent_transcripts_use_distinct_stream_ids(self):
         source = self.root / 'sessions'
         self.write_path(source / 'session.jsonl', [self.event('main')])
