@@ -29,6 +29,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Audit publishable files
         run: python scripts/release_audit.py
+      - name: Install package
+        run: python -m pip install .
       - name: Install optional MCP SDK
         if: matrix.python-version == '3.12'
         run: python -m pip install '.[mcp]'
