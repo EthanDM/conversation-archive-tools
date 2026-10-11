@@ -44,10 +44,10 @@ def create_server():
     def search_conversations(provider: Provider, query: str, role: Literal["user", "assistant"] | None = None,
                              start_date: str | None = None, end_date: str | None = None,
                              limit: int = 10, offset: int = 0) -> dict[str, Any]:
-        """Find indexed messages with FTS5 text search or literal title matching, newest first.
+        """Find indexed messages with FTS5 text search or literal title matching, ranked by text relevance before title-only hits.
 
         Dates are inclusive YYYY-MM-DD in each source timestamp's recorded calendar date.
-        Limit 1–50; snippets cap at 1000 characters. Follow next_offset for more matches.
+        Hits label message/title matching; scores are provider-local. Limit 1–50; snippets cap at 1000 characters. Follow next_offset for more matches.
         """
         return run(retrieval.search_conversations, provider, query, role=role,
                    start_date=start_date, end_date=end_date, limit=limit, offset=offset)

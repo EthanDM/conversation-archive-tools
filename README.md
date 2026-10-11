@@ -276,7 +276,7 @@ Nine read-only tools are exposed: `archive_status`, `search_conversations`,
 tool incrementally refreshes configured Codex or Claude Code session indexes. Providers are `chatgpt`,
 `claude`, `codex`, and `claude_code`. Search accepts FTS5 syntax for message
 text and literal title matching, optional user/assistant role and inclusive
-source-calendar date bounds. Results are newest first within one provider;
+source-calendar date bounds. Message-text hits rank by FTS relevance before title-only hits, with newest dates breaking ties. Each hit reports `match_type` (`message`, `title`, or `message_and_title`) and a provider-local `relevance_score` (null for title-only hits);
 missing timestamps do not match date filters. Pagination reports `has_more`
 and `next_offset`; long message text reports truncation and can be recovered
 with `read_message_context` character offsets. IDs are provider-local and may

@@ -100,6 +100,31 @@ class RetrievalTests(unittest.TestCase):
         self.assertTrue(all(item['available'] for item in status['providers']))
         self.assertTrue(all(item['last_refresh'] is None for item in status['providers']))
 
+    def test_relevance_and_match_labels_across_providers(self):
+        for provider, path in self.paths.items():
+            with self.subTest(provider=provider):
+                ranked = retrieval.search_conversations(provider, 'needle', path=path)
+                self.assertEqual(ranked['items'][0]['message_index_id'], 2)
+                self.assertTrue(all(hit['match_type'] == 'message' for hit in ranked['items']))
+                with sqlite3.connect(path) as connection:
+                    table = 'sessions' if provider in {'codex', 'claude_code'} else 'conversations'
+                    connection.execute(f"UPDATE {table} SET title='needle topic'")
+                    connection.execute("UPDATE messages SET text='unrelated reply' WHERE id=2")
+                    if provider == 'claude':
+                        connection.execute('DELETE FROM messages_fts WHERE rowid=2')
+                        connection.execute("INSERT INTO messages_fts(rowid,text,title) VALUES (2,'unrelated reply','needle topic')")
+                first = retrieval.search_conversations(provider, 'needle', limit=1, path=path)
+                self.assertEqual(first['items'][0]['message_index_id'], 1)
+                self.assertEqual(first['items'][0]['match_type'], 'message_and_title')
+                second = retrieval.search_conversations(provider, 'needle', limit=1,
+                                                       offset=first['next_offset'], path=path)
+                self.assertEqual(second['items'][0]['match_type'], 'title')
+                self.assertIsNone(second['items'][0]['relevance_score'])
+                grouped = retrieval.search_topic(provider, 'needle', role=None, path=path)
+                self.assertEqual(grouped['matching_messages'], 2)
+                self.assertEqual({hit['match_type'] for hit in grouped['items'][0]['samples']},
+                                 {'message_and_title', 'title'})
+
     def test_provider_rejection_missing_and_invalid(self):
         for provider in self.paths:
             for other,path in self.paths.items():

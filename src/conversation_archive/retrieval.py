@@ -104,13 +104,15 @@ def search_conversations(provider: str, query: str, *, role: str | None = None,
                          limit: int = 10, offset: int = 0, path: Path | None = None) -> dict:
     """Search indexed message text or titles using FTS5 syntax and inclusive timestamp dates.
 
-    Missing timestamps cannot match date filters. Results are newest first within this provider; title matches use literal query text.
+    Text hits rank by FTS relevance before literal title-only hits; dates break ties.
+    Scores are provider-local. Missing timestamps cannot match date filters.
     """
     validate_page(limit, offset)
     predicate, args = search_predicate(query, role, start_date, end_date)
     with open_index(provider, path) as connection:
-        sql = f"SELECT n.* FROM ({projection(provider, connection)}) n WHERE {predicate}"
-        rows = connection.execute(sql + " ORDER BY timestamp DESC, message_index_id DESC LIMIT ? OFFSET ?", args + [limit + 1, offset]).fetchall()
+        sql = matched_messages(provider, connection, predicate)
+        rows = connection.execute(sql + " ORDER BY relevance_score IS NULL, relevance_score, timestamp DESC, message_index_id DESC LIMIT ? OFFSET ?",
+                                  [text_query(query), literal_pattern(query)] + args + [limit + 1, offset]).fetchall()
         return {"provider": provider, "scope": "indexed_messages_only", **page_result(rows, limit, offset, 1000)}
 
 
@@ -268,6 +270,25 @@ def search_all_conversations(query: str, *, role: str | None = None,
     return response
 
 
+def text_query(query: str) -> str:
+    """Restrict FTS matching to message text so indexed titles cannot masquerade as text hits."""
+    return f"text : ({query})"
+
+
+def matched_messages(provider: str, connection: sqlite3.Connection, predicate: str) -> str:
+    """Project match provenance and provider-local BM25 scores for the shared match set."""
+    # LIMIT prevents flattening: SQLite must evaluate bm25 in the FTS cursor context.
+    return f"""WITH text_hits AS (
+        SELECT rowid, bm25(messages_fts) AS score FROM messages_fts
+        WHERE messages_fts MATCH ? LIMIT -1
+    ) SELECT n.*, h.score AS relevance_score,
+        CASE WHEN h.rowid IS NOT NULL AND n.title LIKE ? ESCAPE '\\'
+             THEN 'message_and_title'
+             WHEN h.rowid IS NOT NULL THEN 'message' ELSE 'title' END AS match_type
+        FROM ({projection(provider, connection)}) n
+        LEFT JOIN text_hits h ON h.rowid=n.message_index_id WHERE {predicate}"""
+
+
 def search_predicate(query: str, role: str | None, start_date: str | None,
                      end_date: str | None) -> tuple[str, list]:
     """Share exact match/filter semantics between message search and grouped topic search."""
@@ -277,7 +298,7 @@ def search_predicate(query: str, role: str | None, start_date: str | None,
         raise ValueError("role must be user or assistant")
     date_filters(start_date, end_date)
     predicate = "(message_index_id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) OR title LIKE ? ESCAPE '\\')"
-    args = [query, literal_pattern(query)]
+    args = [text_query(query), literal_pattern(query)]
     for condition, value in (("role = ?", role), ("substr(timestamp,1,10) >= ?", start_date), ("substr(timestamp,1,10) <= ?", end_date)):
         if value is not None:
             predicate += " AND " + condition
@@ -300,7 +321,8 @@ def search_topic(provider: str, query: str, *, role: str | None = "user",
         raise ValueError("order must be chronological or recent")
     predicate, args = search_predicate(query, role, start_date, end_date)
     with open_index(provider, path) as connection:
-        matched = f"SELECT * FROM ({projection(provider, connection)}) WHERE {predicate}"
+        matched = matched_messages(provider, connection, predicate)
+        args = [text_query(query), literal_pattern(query)] + args
         counts = dict(connection.execute(f"SELECT count(*) AS matching_messages,count(DISTINCT conversation_id) AS matching_conversations FROM ({matched})", args).fetchone())
         sort = "first_match ASC" if order == "chronological" else "last_match DESC"
         rows = connection.execute(f"""SELECT conversation_id,title,source,cwd,
