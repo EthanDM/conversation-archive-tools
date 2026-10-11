@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 
-INDEXER_VERSION = "1"
+INDEXER_VERSION = "2"
 TITLE_LIMIT = 140
 
 SCHEMA_SQL = """
@@ -57,8 +57,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   title,
   role UNINDEXED,
   create_time_iso UNINDEXED,
-  content='messages',
-  content_rowid='id',
   tokenize='unicode61 remove_diacritics 2'
 );
 
@@ -75,11 +73,11 @@ CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  DELETE FROM messages_fts WHERE rowid=old.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  DELETE FROM messages_fts WHERE rowid=old.id;
   INSERT INTO messages_fts(rowid, text, session_id, title, role, create_time_iso)
   VALUES (
     new.id,
@@ -99,6 +97,7 @@ WRAPPER_MARKERS = (
     "<skills_instructions>",
     "<recommended_plugins>",
     "<skill>",
+    "<external_codex_apps_open_page>",
     "# agents.md instructions",
     "the following is the codex agent history whose request action you are assessing",
 )
@@ -132,6 +131,15 @@ def _normalise_timestamp(value: object) -> Optional[str]:
         return value
 
 
+
+def is_approval_envelope(text: object) -> bool:
+    """Recognize leading machine approval envelopes, not mentions within a human request."""
+    return isinstance(text, str) and text.strip().lower().startswith((
+        ">>> retained user instructions start", ">>> transcript start",
+        "the following is the codex agent history added since your last approval assessment",
+        "the following is the codex agent history whose request action you are assessing",
+    ))
+
 def _clean_text(text: object) -> str:
     if not isinstance(text, str):
         return ""
@@ -139,6 +147,8 @@ def _clean_text(text: object) -> str:
     if not cleaned:
         return ""
     lowered = cleaned.lower()
+    if is_approval_envelope(cleaned):
+        return ""
     if any(marker in lowered for marker in WRAPPER_MARKERS):
         return ""
     # IDE context is often useful only for the final request. Keep that request, not file/tab noise.
@@ -196,6 +206,12 @@ def parse_session_file(path: Path) -> Optional[ParsedSession]:
                 continue
             timestamp = _normalise_timestamp(event.get("timestamp"))
             if event.get("type") == "session_meta":
+                source = payload.get("source")
+                guardian = (isinstance(source, dict)
+                            and isinstance(source.get("subagent"), dict)
+                            and source["subagent"].get("other") == "guardian")
+                if payload.get("thread_source") == "guardian_review" or guardian:
+                    return None
                 candidate_id = payload.get("id")
                 if isinstance(candidate_id, str) and candidate_id:
                     session_id = session_id or candidate_id
@@ -208,6 +224,11 @@ def parse_session_file(path: Path) -> Optional[ParsedSession]:
             role = payload.get("role")
             if role not in {"user", "assistant"}:
                 continue
+            if role == "user" and any(
+                is_approval_envelope(block.get("text"))
+                for block in payload.get("content", []) if isinstance(block, dict)
+            ):
+                return None
             text = _message_text(payload, role)
             if not text:
                 continue
@@ -242,8 +263,43 @@ def connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.execute("PRAGMA foreign_keys=ON")
     connection.executescript(SCHEMA_SQL)
+    repair_session_fts(connection)
     return connection
 
+
+
+def repair_session_fts(connection: sqlite3.Connection) -> None:
+    """Replace the legacy external-content FTS table atomically, preserving message IDs.
+
+    Session titles are joined from sessions, not columns in messages. A standalone
+    FTS table stores that projection so bm25/snippet and deletions work reliably.
+    Both Codex and Claude Code share this storage schema.
+    """
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE name='messages_fts'").fetchone()
+    if row is None or not re.search(r"content\s*=", row[0], re.I):
+        return
+    # DDL via execute stays inside the transaction; executescript would commit early.
+    with connection:
+        if not connection.in_transaction:
+            connection.execute("BEGIN")
+        for name in ("messages_ai", "messages_ad", "messages_au"):
+            connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+        connection.execute("DROP TABLE messages_fts")
+        connection.execute("""CREATE VIRTUAL TABLE messages_fts USING fts5(
+            text, session_id UNINDEXED, title, role UNINDEXED, create_time_iso UNINDEXED,
+            tokenize='unicode61 remove_diacritics 2')""")
+        connection.execute("""INSERT INTO messages_fts(rowid,text,session_id,title,role,create_time_iso)
+            SELECT m.id,m.text,m.session_id,s.title,m.role,m.create_time_iso
+            FROM messages m JOIN sessions s USING(session_id)""")
+        connection.execute("""CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid,text,session_id,title,role,create_time_iso)
+            VALUES(new.id,new.text,new.session_id,(SELECT title FROM sessions WHERE session_id=new.session_id),new.role,new.create_time_iso); END""")
+        connection.execute("""CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid=old.id; END""")
+        connection.execute("""CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid=old.id;
+            INSERT INTO messages_fts(rowid,text,session_id,title,role,create_time_iso)
+            VALUES(new.id,new.text,new.session_id,(SELECT title FROM sessions WHERE session_id=new.session_id),new.role,new.create_time_iso); END""")
 
 def scope_index_to_input(
     cursor: sqlite3.Cursor,
@@ -251,17 +307,18 @@ def scope_index_to_input(
     source_paths: set[str],
     *,
     remove_missing: bool,
+    additional_inputs: tuple[Path, ...] = (),
 ) -> None:
-    """Remove rows outside the input or whose source file is no longer present."""
+    """Remove rows outside all explicit inputs or whose source file is no longer present."""
+    roots = (input_path, *additional_inputs)
     out_of_scope = [
         (source_path,)
         for (source_path,) in cursor.execute("SELECT source_path FROM sessions")
         if (
             (remove_missing and source_path not in source_paths)
-            or (
-                Path(source_path) != input_path
-                if input_path.is_file()
-                else not Path(source_path).is_relative_to(input_path)
+            or not any(
+                Path(source_path) == root or (root.is_dir() and root in Path(source_path).parents)
+                for root in roots
             )
         )
     ]
@@ -323,14 +380,22 @@ def index_sessions(
     reset: bool = False,
     incremental: bool = True,
     limit: Optional[int] = None,
+    additional_inputs: tuple[Path, ...] = (),
 ) -> tuple[int, int, int]:
     """Refresh a local session index and return indexed, skipped, and retained counts.
 
     Incremental mode trusts the source file's size and nanosecond mtime; changed
     files replace prior rows for either their path or their session ID. ``reset``
-    removes only the target SQLite database and its WAL sidecars.
+    removes only the target SQLite database and its WAL sidecars. Explicit additional
+    inputs form one source union; all roots must exist before any index writes.
     """
     input_path = input_path.expanduser().resolve()
+    additional_inputs = tuple(path.expanduser().resolve() for path in additional_inputs)
+    for root in additional_inputs:
+        if not root.exists():
+            raise FileNotFoundError("Additional Codex session input does not exist")
+        if not root.is_file() and not root.is_dir():
+            raise ValueError("Additional Codex input must be a file or directory")
     if not input_path.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {input_path}")
     if not input_path.is_file() and not input_path.is_dir():
@@ -339,14 +404,21 @@ def index_sessions(
     if reset:
         for suffix in ("", "-wal", "-shm"):
             db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
-    all_paths = list(iter_session_files(input_path))
+    all_paths = sorted({path for root in (input_path, *additional_inputs) for path in iter_session_files(root)})
     source_paths = {str(path.resolve()) for path in all_paths}
     paths = all_paths
     if limit is not None:
         paths = paths[:limit]
     connection = connect(db_path)
     cursor = connection.cursor()
-    scope_index_to_input(cursor, input_path, source_paths, remove_missing=limit is None)
+    version = cursor.execute("SELECT value FROM index_meta WHERE key='indexer_version'").fetchone()
+    if version != (INDEXER_VERSION,):
+        if limit is not None and cursor.execute("SELECT count(*) FROM sessions").fetchone()[0]:
+            connection.close()
+            raise ValueError("Filter-version migration requires a full refresh without limit")
+        incremental = False
+    scope_index_to_input(cursor, input_path, source_paths, remove_missing=limit is None,
+                         additional_inputs=additional_inputs)
     indexed = skipped = retained_messages = 0
     displaced_session_ids: set[str] = set()
 
@@ -413,6 +485,14 @@ def index_sessions(
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (INDEXER_VERSION,),
     )
+    cursor.execute("INSERT INTO index_meta(key,value) VALUES('source_roots',?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (json.dumps([str(root) for root in (input_path, *additional_inputs)]),))
+    cursor.execute("INSERT INTO index_meta(key,value) VALUES('source_root',?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(input_path),))
+    cursor.execute("INSERT INTO index_meta(key,value) VALUES('last_refresh_completed_at',?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (dt.datetime.now(dt.timezone.utc).isoformat(),))
     connection.commit()
     connection.close()
     return indexed, skipped, retained_messages

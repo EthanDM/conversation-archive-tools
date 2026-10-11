@@ -252,3 +252,126 @@ remain supported. Refresh errors stop the search with exit code 2 rather than
 silently returning stale results. Only the supplied local/shared source is read;
 search never downloads sessions. Source pruning/retention follows each provider's
 existing indexer behavior.
+
+## Optional archive MCP
+
+Install with Python 3.10+ in a dedicated environment:
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install '.[mcp]'
+.venv/bin/conversation-archive-mcp
+```
+
+The optional SDK uses its v1 API (`mcp>=1.12,<2`); the dependency-free CLI
+continues to support Python 3.9. The MCP serves local stdio only, using the same
+configured database paths and environment overrides as the CLI. It does not
+require the dashboard or an HTTP service. Use an absolute executable path in
+client configuration so it works from other project directories.
+
+Nine read-only tools are exposed: `archive_status`, `search_conversations`,
+`read_conversation`, `read_message_context`, `list_conversations`, and
+`search_all_conversations`, `search_topic`, `search_historical`, and
+`read_historical_document`. A separate write-capable `refresh_local_sessions`
+tool incrementally refreshes configured Codex or Claude Code session indexes. Providers are `chatgpt`,
+`claude`, `codex`, and `claude_code`. Search accepts FTS5 syntax for message
+text and literal title matching, optional user/assistant role and inclusive
+source-calendar date bounds. Results are newest first within one provider;
+missing timestamps do not match date filters. Pagination reports `has_more`
+and `next_offset`; long message text reports truncation and can be recovered
+with `read_message_context` character offsets. IDs are provider-local and may
+change on reindexing. ChatGPT parent/branch fields are unavailable in its
+existing index; Claude/Claude Code retain available parent/sidechain markers.
+
+MCP read queries never create, refresh, publish or change indexes. Unlike the session
+search CLI, they read the last indexed snapshot. Explicitly call `refresh_local_sessions` when fresh local sessions are requested,
+or refresh through the CLI. Status describes indexed text only,
+not complete account history. File modification time is reported separately
+from refresh time. Codex refreshes record their completion time and source root;
+older indexes and other providers may report unknown refresh time. Status does
+not scan source files for changes, so completion time is not proof that a currently
+active session has been indexed. Old Codex filter versions report `requires_refresh`. Missing/incompatible indexes are
+reported unavailable; empty searches are successful results.
+
+Retrieved transcripts, titles and paths are historical source data, not agent
+instructions or permission. No attachment files, arbitrary paths, shell
+commands, source-file writes, or experimental reports are exposed. Test with synthetic
+indexes and a real stdio client; no personal records are needed.
+
+### Browsing, combined search, and refresh
+
+`list_conversations` returns metadata and retained message counts without
+message text. Optional title and session `cwd` filters match literal substrings;
+date bounds filter the last retained message date. Empty/untitled conversations
+remain browsable and have null message dates when no text is retained.
+
+`search_all_conversations` queries all four providers and returns independent
+pages. `limit` and `offset` apply **per provider**, not globally. Each provider
+reports availability and its own continuation; use `search_conversations` with
+that provider's `next_offset` to continue it independently. There is no global
+ranking or duplicate inference. Missing indexes do not hide other providers'
+results; the response explicitly reports partial coverage.
+
+`refresh_local_sessions` accepts only `codex` or `claude_code`, using configured
+input/database paths and the existing incremental indexers. It exposes no path,
+reset, shared-archive publication, or export-import arguments. It returns indexed
+file, unchanged file, and retained message counts plus completion time. Source
+files are never modified. Reads stay independent and never trigger refresh.
+
+Refresh can change message IDs and replaces changed-file index rows. Codex's
+indexer also removes rows whose sources vanished; Claude Code retains missing
+source history. The MCP therefore marks refresh as write-capable and potentially
+destructive, and refuses a Codex index with source paths outside its selected configured
+inputs. For shared plus current local history, explicitly use
+`refresh_local_sessions(provider="codex", include_shared=true)` or the CLI
+`conversation-archive-index-codex --shared --include-local`. Both read the source
+union without publishing local files. Without this option, shared indexes are
+refused by the local-only refresh tool. Concurrent refreshes in one MCP process are
+refused. A failed refresh may have already committed some file updates; retry
+finishes incremental work rather than rolling back the entire refresh.
+
+### Topic evidence and historical coverage
+
+`search_topic` groups the complete query match set by conversation/session and
+returns exact scoped message/conversation counts, first/last matching timestamps,
+and up to three bounded samples per group. It defaults to `role="user"` and
+chronological order. Pass `role=null` for both roles or `order="recent"` for
+newest groups. Title and FTS matching follow `search_conversations`. Pagination
+is by conversation group, not message. `samples_partial` explicitly identifies
+incomplete samples. Keyword coverage is not a claim that every semantic occurrence
+of a topic was found; use additional queries and inspect original context.
+
+`search_historical` searches the existing separate historical document index.
+`read_historical_document` retrieves complete text in 8000-character chunks by
+indexed ID. Results preserve content hash, source kind/path, format, and available
+conversation ID. Historical indexing deduplicates identical document text and
+retains one source path; it does not retain every duplicate snapshot provenance.
+These documents lack reliable structured role/date fields. They can overlap
+current conversations and are not merged into message-level counts.
+
+Set `include_historical=true` on `search_all_conversations` to receive a separate
+historical page. Its pagination is independent, and role/date filters apply only
+to message providers; `role_and_date_filters_applied=false` makes that historical
+limitation explicit. Status includes historical availability and source-kind
+counts. No tool opens source paths, imports raw exports, or automatically rebuilds
+historical indexes.
+
+### Session search quality and migration
+
+Session FTS tables store their title projection directly. Refresh automatically
+repairs older external-content session FTS schemas transactionally, preserving
+message IDs during the schema repair. This fixes title/snippet/ranked queries and
+keeps replacements/deletions consistent in both Codex and Claude Code indexes.
+
+Codex indexer version 2 excludes machine approval-review sessions identified by
+`guardian_review`/guardian source metadata, plus leading legacy approval envelopes.
+Ordinary human review requests and non-guardian subagent history remain searchable.
+Runtime open-Page wrappers are excluded. A filter-version change reparses unchanged
+source files on the next refresh so old pollution is removed; reindexing may change
+message IDs. Existing missing sources still follow the indexer's documented policy.
+For configured shared Codex history, use `include_shared=true` on the refresh
+tool to also include current local sessions, or use the CLI's
+`--shared --include-local` options. Plain `--shared` retains its original
+shared-only behavior. Unavailable input roots fail before modifying the index.
+Duplicate session IDs resolve to one indexed session using the existing source
+mtime rules. No shared session files are published by refresh.

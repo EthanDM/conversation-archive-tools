@@ -9,7 +9,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from ..codex.session_index import SCHEMA_SQL
+from ..codex.session_index import SCHEMA_SQL, repair_session_fts
 
 VERSION = "2"
 # Increment when parser semantics require unchanged source files to be reparsed.
@@ -29,12 +29,10 @@ CLAUDE_FTS_TRIGGERS = (
   VALUES (new.id, new.text, new.session_id, new.title, new.role, new.create_time_iso);
 END""",
     """CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text, session_id, title, role, create_time_iso)
-  VALUES ('delete', old.id, old.text, old.session_id, old.title, old.role, old.create_time_iso);
+  DELETE FROM messages_fts WHERE rowid=old.id;
 END""",
     """CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text, session_id, title, role, create_time_iso)
-  VALUES ('delete', old.id, old.text, old.session_id, old.title, old.role, old.create_time_iso);
+  DELETE FROM messages_fts WHERE rowid=old.id;
   INSERT INTO messages_fts(rowid, text, session_id, title, role, create_time_iso)
   VALUES (new.id, new.text, new.session_id, new.title, new.role, new.create_time_iso);
 END""",
@@ -78,7 +76,6 @@ def _migrate_database(connection: sqlite3.Connection) -> None:
             "UPDATE messages SET title=(SELECT title FROM sessions WHERE sessions.session_id=messages.session_id)"
         )
         _replace_fts_triggers(connection)
-        connection.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         connection.execute("UPDATE index_meta SET value=? WHERE key='schema_version'", (VERSION,))
 
 
@@ -189,6 +186,7 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
 
     Returns indexed-file, unchanged-file, and total retained-message counts. Each
     file is replaced in one transaction; a failure preserves its previous index.
+    Separate subagent transcripts use distinct stream IDs, retaining parent provenance.
     """
     input_path, db_path = input_path.expanduser().resolve(), db_path.expanduser().resolve()
     if not input_path.exists():
@@ -199,6 +197,10 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
     try:
         tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         if tables:
+            check_metadata = dict(connection.execute("SELECT key, value FROM index_meta"))
+            if check_metadata.get("provider") != "claude_code":
+                raise ValueError("Database is not a Claude Code session index")
+            repair_session_fts(connection)
             _migrate_database(connection)
         else:
             # Use the Codex retrieval schema, with Claude-specific provenance columns.
@@ -214,6 +216,7 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
                 ("parser_version", PARSER_VERSION),
             ])
             connection.commit()
+        repair_session_fts(connection)
         _invalidate_outdated_parser_cache(connection)
         connection.execute("PRAGMA foreign_keys=ON")
         indexed = skipped = 0
