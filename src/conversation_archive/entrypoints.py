@@ -102,3 +102,18 @@ def search_claude() -> int:
 
 def show_claude() -> int:
     return _run(show_claude_main)
+
+
+def index_claude_code() -> int:
+    from .claude_code.index import main
+    return _run(main)
+
+
+def search_claude_code() -> int:
+    from .claude_code.search import main
+    return _run(main)
+
+
+def show_claude_code() -> int:
+    from .claude_code.show import main
+    return _run(main)

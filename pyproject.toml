@@ -17,6 +17,9 @@ classifiers = [
 ]
 
 [project.scripts]
+conversation-archive-index-claude-code = "conversation_archive.entrypoints:index_claude_code"
+conversation-archive-search-claude-code = "conversation_archive.entrypoints:search_claude_code"
+conversation-archive-show-claude-code = "conversation_archive.entrypoints:show_claude_code"
 conversation-archive-index-claude = "conversation_archive.entrypoints:index_claude"
 conversation-archive-search-claude = "conversation_archive.entrypoints:search_claude"
 conversation-archive-show-claude = "conversation_archive.entrypoints:show_claude"
