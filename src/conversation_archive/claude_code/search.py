@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -64,7 +65,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--width", type=int, default=100)
     parser.add_argument("--lines", type=int, default=10)
     args = parser.parse_args(argv)
-    return search(Path(args.db).expanduser(), args.query, limit=args.limit, context=args.context, width=args.width, lines=args.lines)
+    try:
+        return search(Path(args.db).expanduser(), args.query, limit=args.limit,
+                      context=args.context, width=args.width, lines=args.lines)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"Claude Code search failed: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -77,21 +77,24 @@ def _session_stream_id(path: Path, observed_ids: list[str]) -> str:
 
     Fork files may start with copied ancestor events, so a matching filename or
     the latest observed ID owns the stream. Subagent files share their parent's
-    event ID and therefore add their agent filename as a stream discriminator.
+    event ID and therefore add their path below ``subagents`` as a discriminator.
     """
     owning_id = path.stem if path.stem in observed_ids else observed_ids[-1]
-    if path.parent.name == "subagents":
-        return f"{owning_id}:subagent:{path.stem}"
+    for parent in path.parents:
+        if parent.name == "subagents":
+            relative_path = path.relative_to(parent).with_suffix("")
+            return f"{owning_id}:subagent:{':'.join(relative_path.parts)}"
     return owning_id
 
 
 def parse_session_file(path: Path) -> dict | None:
     """Retain text blocks and source identifiers, deduplicating repeated UUIDs.
 
-    Tool-result user records and messages marked as metadata, compaction
-    summaries, system-origin prompts, or task notifications do not represent
-    conversation text. An identified, fully parsed session may contain no retained
-    messages; None means the file did not contain enough valid data to update safely.
+    Tool-result user records and most metadata messages, compaction summaries,
+    system-origin prompts, or task notifications do not represent conversation
+    text. External channel messages are genuine human prompts even though Claude
+    Code marks them as metadata. An identified, fully parsed session may contain
+    no retained messages; None means the file lacked enough valid data to update safely.
     """
     session_ids, cwd, title = [], "", ""
     saw_message_event = False
@@ -118,10 +121,15 @@ def parse_session_file(path: Path) -> dict | None:
             message = event.get("message")
             if role in {"user", "assistant"} and isinstance(message, dict):
                 saw_message_event = True
-            if (role not in {"user", "assistant"} or event.get("isMeta")
+            origin = event.get("origin")
+            is_external_channel_message = (role == "user" and event.get("isMeta")
+                                           and isinstance(origin, dict)
+                                           and origin.get("kind") == "channel"
+                                           and event.get("userType") == "external")
+            if (role not in {"user", "assistant"}
+                    or (event.get("isMeta") and not is_external_channel_message)
                     or event.get("isCompactSummary") or event.get("promptSource") == "system"
-                    or (isinstance(event.get("origin"), dict)
-                        and event["origin"].get("kind") == "task-notification")):
+                    or (isinstance(origin, dict) and origin.get("kind") == "task-notification")):
                 continue
             if not isinstance(message, dict):
                 continue

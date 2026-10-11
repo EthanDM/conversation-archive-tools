@@ -211,16 +211,18 @@ conversation-archive-show-claude-code --title "planning" --list
 conversation-archive-show-claude-code --session <session-id>
 ```
 
-The input defaults to `~/.claude/projects`; the database defaults to
+The input defaults to `$CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is
+set, and `~/.claude/projects` otherwise. The database defaults to
 `~/Library/Application Support/Conversation Archive Tools/claude_code_sessions.sqlite`.
 Override with `--input` / `--db` or `CLAUDE_CODE_SESSION_INPUT` /
 `CLAUDE_CODE_SESSION_DB`. Re-run indexing to refresh changed files; use
 `--no-incremental` to reparse all files. Missing source files do not erase archived
 sessions. Other providers' databases are refused.
 
-Only user and assistant text is indexed. Thinking, tool payloads, images, metadata
-messages, and system-origin prompts are excluded. Message UUIDs, parent UUIDs,
-sidechain flags, timestamps, project paths, and custom titles are retained.
+Only user and assistant text is indexed, including external channel prompts. Thinking,
+tool payloads, images, internal metadata messages, and system-origin prompts are
+excluded. Message UUIDs, parent UUIDs, sidechain flags, timestamps, project paths,
+and custom titles are retained.
 Transcripts follow file order and show branch markers; no branch is selected.
 Malformed JSONL lines (including a partially written active-session tail) are
 skipped. This does not collect regular Claude web/desktop chats or Cowork history.

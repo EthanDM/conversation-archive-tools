@@ -1,11 +1,14 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from conversation_archive.claude_code.paths import default_input_path
 from conversation_archive.claude_code.session_index import index_sessions, connect_readonly
 from conversation_archive.codex.session_index import SCHEMA_SQL
 from conversation_archive.claude_code.search import main as search
@@ -88,6 +91,26 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
                 "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'machinegeneratedstatus'"
             ).fetchone()[0], 0)
 
+    def test_external_channel_messages_are_indexed_as_human_prompts(self):
+        self.write([
+            self.event('channel', content='message from Discord', isMeta=True,
+                       origin={'kind': 'channel'}, userType='external'),
+            self.event('internal-meta', content='internal metadata', isMeta=True),
+            self.event('assistant', 'assistant', 'channel answer'),
+        ])
+        self.assertEqual(index_sessions(self.source, self.db), (1, 0, 2))
+        with contextlib.closing(connect_readonly(self.db)) as connection:
+            session = connection.execute(
+                'SELECT title, user_message_count FROM sessions'
+            ).fetchone()
+            self.assertEqual(tuple(session), ('message from Discord', 1))
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'text:Discord'"
+            ).fetchone()[0], 1)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'internal'"
+            ).fetchone()[0], 0)
+
     def test_filtered_empty_transcript_removes_previous_index(self):
         for incremental in (True, False):
             with self.subTest(incremental=incremental):
@@ -124,12 +147,19 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
         self.write_path(source / 'session.jsonl', [self.event('main')])
         self.write_path(source / 'session' / 'subagents' / 'agent-worker.jsonl',
                         [self.event('worker', content='delegated answer')])
-        self.assertEqual(index_sessions(source, self.db), (2, 0, 2))
+        self.write_path(source / 'session' / 'subagents' / 'workflows' / 'wf_example' /
+                        'agent-worker.jsonl',
+                        [self.event('workflow', content='workflow answer')])
+        self.assertEqual(index_sessions(source, self.db), (3, 0, 3))
         with contextlib.closing(connect_readonly(self.db)) as connection:
-            session_ids = [row['session_id'] for row in connection.execute(
-                'SELECT session_id FROM sessions ORDER BY source_path'
-            )]
-        self.assertEqual(session_ids, ['session', 'session:subagent:agent-worker'])
+            session_ids = {row['session_id'] for row in connection.execute(
+                'SELECT session_id FROM sessions'
+            )}
+        self.assertEqual(session_ids, {
+            'session',
+            'session:subagent:agent-worker',
+            'session:subagent:workflows:wf_example:agent-worker',
+        })
 
     def test_forked_transcript_uses_child_session_id(self):
         source = self.root / 'child.jsonl'
@@ -152,6 +182,27 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
         with contextlib.closing(connect_readonly(self.db)) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'oldword'").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'text:newword'").fetchone()[0], 1)
+
+    def test_invalid_fts_query_is_reported_without_traceback(self):
+        self.write([self.event('user', content='searchable')])
+        self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
+        error_output = io.StringIO()
+        with contextlib.redirect_stderr(error_output):
+            self.assertEqual(search(['"', '--db', str(self.db)]), 2)
+        self.assertIn('Claude Code search failed: unterminated string',
+                      error_output.getvalue())
+
+    def test_input_default_honors_claude_config_dir(self):
+        with patch.dict(os.environ, {
+            'CLAUDE_CODE_SESSION_INPUT': '/explicit/sessions',
+            'CLAUDE_CONFIG_DIR': '/custom/config',
+        }, clear=True):
+            self.assertEqual(default_input_path(), '/explicit/sessions')
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/custom/config'}, clear=True):
+            self.assertEqual(default_input_path(), '/custom/config/projects')
+        with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home',
+                                                                  return_value=Path('/tmp/generic-home')):
+            self.assertEqual(default_input_path(), '/tmp/generic-home/.claude/projects')
 
     def test_migrates_legacy_database_and_removes_old_title_terms(self):
         with sqlite3.connect(self.db) as connection:
