@@ -46,7 +46,7 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'secretthought OR secrettool OR secretresult'").fetchone()[0], 0)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertEqual(search(['searchable', '--db', str(self.db), '--context', '1']), 0)
+            self.assertEqual(search(['searchable', '--db', str(self.db), '--no-refresh', '--context', '1']), 0)
             self.assertEqual(show(['--session', 'session', '--db', str(self.db)]), 0)
         self.assertIn('Named session', output.getvalue())
         self.assertIn('visible answer', output.getvalue())

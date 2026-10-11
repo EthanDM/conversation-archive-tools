@@ -228,3 +228,25 @@ skipped. This does not collect regular Claude web/desktop chats or Cowork histor
 Without an installed package, run commands from this checkout with
 `PYTHONPATH=src python3 -m conversation_archive.claude_code.index` (or `.search` /
 `.show`).
+
+## Refresh before local-session search
+
+Codex and Claude Code search commands incrementally refresh local session files
+before querying, so new sessions and appended messages are searchable immediately.
+Unchanged files are skipped. Search now writes to the session index by default;
+`--no-refresh` searches an existing snapshot read-only and needs no source files.
+Transcript display and account-export searches do not refresh.
+
+```bash
+conversation-archive-search-codex '"project planning"'
+conversation-archive-search-claude-code '"project planning"' --no-refresh
+conversation-archive-search-codex 'planning' --shared
+conversation-archive-search-codex 'planning' --input /path/to/sessions --db /path/to/index.sqlite
+```
+
+For custom `--db` paths, supply `--input` (or Codex `--shared`) to refresh, or
+`--no-refresh` to preserve the snapshot. Input and database environment defaults
+remain supported. Refresh errors stop the search with exit code 2 rather than
+silently returning stale results. Only the supplied local/shared source is read;
+search never downloads sessions. Source pruning/retention follows each provider's
+existing indexer behavior.
