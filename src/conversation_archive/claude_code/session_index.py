@@ -11,7 +11,24 @@ from pathlib import Path
 
 from ..codex.session_index import SCHEMA_SQL
 
-VERSION = "1"
+VERSION = "2"
+
+CLAUDE_FTS_TRIGGERS = (
+    """CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, text, session_id, title, role, create_time_iso)
+  VALUES (new.id, new.text, new.session_id, new.title, new.role, new.create_time_iso);
+END""",
+    """CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, text, session_id, title, role, create_time_iso)
+  VALUES ('delete', old.id, old.text, old.session_id, old.title, old.role, old.create_time_iso);
+END""",
+    """CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, text, session_id, title, role, create_time_iso)
+  VALUES ('delete', old.id, old.text, old.session_id, old.title, old.role, old.create_time_iso);
+  INSERT INTO messages_fts(rowid, text, session_id, title, role, create_time_iso)
+  VALUES (new.id, new.text, new.session_id, new.title, new.role, new.create_time_iso);
+END""",
+)
 
 
 def check_database(connection: sqlite3.Connection) -> None:
@@ -32,14 +49,50 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _replace_fts_triggers(connection: sqlite3.Connection) -> None:
+    for name in ("messages_ai", "messages_ad", "messages_au"):
+        connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+    for trigger in CLAUDE_FTS_TRIGGERS:
+        connection.execute(trigger)
+
+
+def _migrate_database(connection: sqlite3.Connection) -> None:
+    """Upgrade the first Claude Code schema and rebuild its incomplete FTS index."""
+    metadata = dict(connection.execute("SELECT key, value FROM index_meta"))
+    if metadata.get("provider") != "claude_code" or metadata.get("schema_version") != "1":
+        check_database(connection)
+        return
+    with connection:
+        connection.execute("ALTER TABLE messages ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            "UPDATE messages SET title=(SELECT title FROM sessions WHERE sessions.session_id=messages.session_id)"
+        )
+        _replace_fts_triggers(connection)
+        connection.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        connection.execute("UPDATE index_meta SET value=? WHERE key='schema_version'", (VERSION,))
+
+
+def _session_stream_id(path: Path, observed_ids: list[str]) -> str:
+    """Return the stable transcript-stream identity represented by one source file.
+
+    Fork files may start with copied ancestor events, so a matching filename or
+    the latest observed ID owns the stream. Subagent files share their parent's
+    event ID and therefore add their agent filename as a stream discriminator.
+    """
+    owning_id = path.stem if path.stem in observed_ids else observed_ids[-1]
+    if path.parent.name == "subagents":
+        return f"{owning_id}:subagent:{path.stem}"
+    return owning_id
+
+
 def parse_session_file(path: Path) -> dict | None:
     """Retain text blocks and source identifiers, deduplicating repeated UUIDs.
 
-    A file must describe one session. Tool-result user records and messages marked
-    as metadata, compaction summaries, or system-origin prompts do not represent
+    Tool-result user records and messages marked as metadata, compaction
+    summaries, system-origin prompts, or task notifications do not represent
     conversation text.
     """
-    session_id, cwd, title = None, "", ""
+    session_ids, cwd, title = [], "", ""
     messages, seen = [], set()
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -51,16 +104,17 @@ def parse_session_file(path: Path) -> dict | None:
                 continue
             candidate = event.get("sessionId")
             if isinstance(candidate, str) and candidate:
-                if session_id and candidate != session_id:
-                    raise ValueError(f"Multiple session IDs in {path}")
-                session_id = candidate
+                if candidate not in session_ids:
+                    session_ids.append(candidate)
             if isinstance(event.get("cwd"), str):
                 cwd = event["cwd"] or cwd
             if event.get("type") == "custom-title" and isinstance(event.get("customTitle"), str):
                 title = event["customTitle"]
             role = event.get("type")
             if (role not in {"user", "assistant"} or event.get("isMeta")
-                    or event.get("isCompactSummary") or event.get("promptSource") == "system"):
+                    or event.get("isCompactSummary") or event.get("promptSource") == "system"
+                    or (isinstance(event.get("origin"), dict)
+                        and event["origin"].get("kind") == "task-notification")):
                 continue
             message = event.get("message")
             if not isinstance(message, dict):
@@ -82,8 +136,9 @@ def parse_session_file(path: Path) -> dict | None:
             parent = event.get("parentUuid")
             messages.append((role, timestamp if isinstance(timestamp, str) else None, text,
                              uuid, parent if isinstance(parent, str) else None, bool(event.get("isSidechain"))))
-    if not session_id or not messages:
+    if not session_ids or not messages:
         return None
+    session_id = _session_stream_id(path, session_ids)
     title = title or next((m[2] for m in messages if m[0] == "user"), f"Claude Code session {session_id}")
     return {"session_id": session_id, "cwd": cwd, "title": " ".join(title.split())[:140], "messages": messages}
 
@@ -103,13 +158,15 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
     try:
         tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         if tables:
-            check_database(connection)
+            _migrate_database(connection)
         else:
             # Use the Codex retrieval schema, with Claude-specific provenance columns.
             connection.executescript(SCHEMA_SQL)
             connection.execute("ALTER TABLE messages ADD COLUMN uuid TEXT")
             connection.execute("ALTER TABLE messages ADD COLUMN parent_uuid TEXT")
             connection.execute("ALTER TABLE messages ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0")
+            connection.execute("ALTER TABLE messages ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+            _replace_fts_triggers(connection)
             connection.executemany("INSERT INTO index_meta VALUES (?, ?)", [("provider", "claude_code"), ("schema_version", VERSION)])
             connection.commit()
         connection.execute("PRAGMA foreign_keys=ON")
@@ -136,8 +193,9 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
                                    (session_id, str(path), session["cwd"], session["title"], min(times) if times else None,
                                     max(times) if times else None, stat.st_size, stat.st_mtime_ns,
                                     sum(m[0] == "user" for m in messages), sum(m[0] == "assistant" for m in messages)))
-                connection.executemany("INSERT INTO messages (session_id, seq, role, create_time_iso, text, uuid, parent_uuid, is_sidechain) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                       [(session_id, seq, *message) for seq, message in enumerate(messages, 1)])
+                connection.executemany("INSERT INTO messages (session_id, seq, role, create_time_iso, text, uuid, parent_uuid, is_sidechain, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                       [(session_id, seq, *message, session["title"])
+                                        for seq, message in enumerate(messages, 1)])
             indexed += 1
         total = connection.execute("SELECT count(*) FROM messages").fetchone()[0]
         return indexed, skipped, total
