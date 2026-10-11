@@ -36,7 +36,8 @@ def open_index(provider: str, path: Path | None = None):
         connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         metadata = dict(connection.execute("SELECT key, value FROM index_meta"))
         if provider in {"claude", "claude_code"}:
-            if metadata.get("provider") != provider or metadata.get("schema_version") != "1":
+            supported_versions = {"1", "2"} if provider == "claude_code" else {"1"}
+            if metadata.get("provider") != provider or metadata.get("schema_version") not in supported_versions:
                 raise ValueError("Wrong provider or unsupported schema")
         elif provider == "codex":
             if metadata.get("provider") not in {None, "codex"} or "indexer_version" not in metadata:
