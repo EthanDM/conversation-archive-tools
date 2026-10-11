@@ -2,7 +2,7 @@
 
 Local-first tools for indexing, searching, and reviewing AI conversation archives.
 
-The project indexes official ChatGPT and Claude exports and local Codex sessions into separate SQLite FTS5 databases. Everything stays on your machine: the tools do not upload conversations, connect to a hosted service, or write to ChatGPT memory.
+The project indexes official ChatGPT and Claude exports and local Codex and Claude Code sessions into separate SQLite FTS5 databases. Everything stays on your machine: the tools do not upload conversations, connect to a hosted service, or write to ChatGPT memory.
 
 ## What it supports
 
@@ -199,3 +199,34 @@ This repository contains code and synthetic tests only. Do not commit exports, S
 ## License
 
 [MIT](LICENSE)
+
+## Claude Code sessions
+
+Claude Code's local JSONL history is separate from Claude account exports:
+
+```bash
+conversation-archive-index-claude-code
+conversation-archive-search-claude-code '"project planning"' --context 2
+conversation-archive-show-claude-code --title "planning" --list
+conversation-archive-show-claude-code --session <session-id>
+```
+
+The input defaults to `$CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is
+set, and `~/.claude/projects` otherwise. The database defaults to
+`~/Library/Application Support/Conversation Archive Tools/claude_code_sessions.sqlite`.
+Override with `--input` / `--db` or `CLAUDE_CODE_SESSION_INPUT` /
+`CLAUDE_CODE_SESSION_DB`. Re-run indexing to refresh changed files; use
+`--no-incremental` to reparse all files. Missing source files do not erase archived
+sessions. Other providers' databases are refused.
+
+Only user and assistant text is indexed, including external channel prompts. Thinking,
+tool payloads, images, internal metadata messages, and system-origin prompts are
+excluded. Message UUIDs, parent UUIDs, sidechain flags, timestamps, project paths,
+and custom titles are retained.
+Transcripts follow file order and show branch markers; no branch is selected.
+Malformed JSONL lines (including a partially written active-session tail) are
+skipped. This does not collect regular Claude web/desktop chats or Cowork history.
+
+Without an installed package, run commands from this checkout with
+`PYTHONPATH=src python3 -m conversation_archive.claude_code.index` (or `.search` /
+`.show`).
