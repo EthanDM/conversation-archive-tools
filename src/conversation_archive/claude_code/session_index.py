@@ -12,6 +12,16 @@ from pathlib import Path
 from ..codex.session_index import SCHEMA_SQL
 
 VERSION = "2"
+# Increment when parser semantics require unchanged source files to be reparsed.
+PARSER_VERSION = "1"
+
+SYNTHETIC_USER_TEXT_PREFIXES = (
+    "<command-name>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<bash-input>",
+    "<bash-stdout>",
+)
 
 CLAUDE_FTS_TRIGGERS = (
     """CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
@@ -70,6 +80,21 @@ def _migrate_database(connection: sqlite3.Connection) -> None:
         _replace_fts_triggers(connection)
         connection.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         connection.execute("UPDATE index_meta SET value=? WHERE key='schema_version'", (VERSION,))
+
+
+def _invalidate_outdated_parser_cache(connection: sqlite3.Connection) -> None:
+    """Force one reparse when stored rows predate the current filtering rules."""
+    metadata = dict(connection.execute("SELECT key, value FROM index_meta"))
+    if metadata.get("parser_version") == PARSER_VERSION:
+        return
+    with connection:
+        # Failed or incomplete reparses retain these sentinels and are retried later.
+        connection.execute("UPDATE sessions SET file_size=-1, file_mtime_ns=-1")
+        connection.execute(
+            "INSERT INTO index_meta(key, value) VALUES('parser_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (PARSER_VERSION,),
+        )
 
 
 def _session_stream_id(path: Path, observed_ids: list[str]) -> str:
@@ -142,6 +167,8 @@ def parse_session_file(path: Path) -> dict | None:
                                      and isinstance(block.get("text"), str)).strip()
             else:
                 continue
+            if role == "user" and text.startswith(SYNTHETIC_USER_TEXT_PREFIXES):
+                continue
             uuid = event.get("uuid")
             if not text or not isinstance(uuid, str) or not uuid or uuid in seen:
                 continue
@@ -181,8 +208,13 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
             connection.execute("ALTER TABLE messages ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0")
             connection.execute("ALTER TABLE messages ADD COLUMN title TEXT NOT NULL DEFAULT ''")
             _replace_fts_triggers(connection)
-            connection.executemany("INSERT INTO index_meta VALUES (?, ?)", [("provider", "claude_code"), ("schema_version", VERSION)])
+            connection.executemany("INSERT INTO index_meta VALUES (?, ?)", [
+                ("provider", "claude_code"),
+                ("schema_version", VERSION),
+                ("parser_version", PARSER_VERSION),
+            ])
             connection.commit()
+        _invalidate_outdated_parser_cache(connection)
         connection.execute("PRAGMA foreign_keys=ON")
         indexed = skipped = 0
         for path in files:

@@ -111,6 +111,27 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
                 "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'internal'"
             ).fetchone()[0], 0)
 
+    def test_synthetic_command_envelopes_are_not_conversation_text(self):
+        self.write([
+            self.event('command-name', content='<command-name>/compact</command-name>'),
+            self.event('command-args', content='<command-args>instructions</command-args>'),
+            self.event('local-output',
+                       content='<local-command-stdout>localoutput</local-command-stdout>'),
+            self.event('bash-input', content='<bash-input>echo inputmarker</bash-input>'),
+            self.event('bash-output', content='<bash-stdout>bashoutput</bash-stdout>'),
+            self.event('assistant', 'assistant', 'visible answer'),
+        ])
+        self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
+        with contextlib.closing(connect_readonly(self.db)) as connection:
+            session = connection.execute(
+                'SELECT title, user_message_count FROM sessions'
+            ).fetchone()
+            self.assertEqual(tuple(session), ('Claude Code session session', 0))
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM messages_fts "
+                "WHERE messages_fts MATCH 'instructions OR localoutput OR inputmarker OR bashoutput'"
+            ).fetchone()[0], 0)
+
     def test_filtered_empty_transcript_removes_previous_index(self):
         for incremental in (True, False):
             with self.subTest(incremental=incremental):
@@ -205,6 +226,11 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
             self.assertEqual(default_input_path(), '/tmp/generic-home/.claude/projects')
 
     def test_migrates_legacy_database_and_removes_old_title_terms(self):
+        self.write([
+            {'type': 'custom-title', 'sessionId': 'session', 'customTitle': 'NewUniqueTitle'},
+            self.event('new', content='stable body'),
+        ])
+        stat = self.source.stat()
         with sqlite3.connect(self.db) as connection:
             connection.executescript(SCHEMA_SQL)
             connection.execute('PRAGMA foreign_keys=ON')
@@ -215,7 +241,7 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
                                    [('provider', 'claude_code'), ('schema_version', '1')])
             connection.execute('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                                ('session', str(self.source.resolve()), '/project', 'OldUniqueTitle', None, None,
-                                1, 1, 1, 0))
+                                stat.st_size, stat.st_mtime_ns, 1, 0))
             connection.execute(
                 'INSERT INTO messages (session_id, seq, role, create_time_iso, text, uuid) VALUES (?, ?, ?, ?, ?, ?)',
                 ('session', 1, 'user', None, 'stable body', 'old'),
@@ -223,18 +249,15 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
             connection.execute("DELETE FROM sessions WHERE session_id='session'")
             connection.execute('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                                ('session', str(self.source.resolve()), '/project', 'CurrentUniqueTitle',
-                                None, None, 1, 1, 1, 0))
+                                None, None, stat.st_size, stat.st_mtime_ns, 1, 0))
             connection.execute(
                 'INSERT INTO messages (session_id, seq, role, create_time_iso, text, uuid) VALUES (?, ?, ?, ?, ?, ?)',
                 ('session', 1, 'user', None, 'stable body', 'current'),
             )
-        self.write([
-            {'type': 'custom-title', 'sessionId': 'session', 'customTitle': 'NewUniqueTitle'},
-            self.event('new', content='stable body'),
-        ])
         self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
         with contextlib.closing(connect_readonly(self.db)) as connection:
             self.assertEqual(dict(connection.execute('SELECT key, value FROM index_meta'))['schema_version'], '2')
+            self.assertEqual(dict(connection.execute('SELECT key, value FROM index_meta'))['parser_version'], '1')
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'title:OldUniqueTitle'"
             ).fetchone()[0], 0)
@@ -244,6 +267,38 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'title:NewUniqueTitle'"
             ).fetchone()[0], 1)
+
+    def test_parser_version_reindexes_unchanged_v2_sessions(self):
+        synthetic = '<local-command-stdout>staleoutput</local-command-stdout>'
+        self.write([
+            self.event('synthetic', content=synthetic),
+            self.event('assistant', 'assistant', 'visible answer'),
+        ])
+        self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("DELETE FROM index_meta WHERE key='parser_version'")
+            connection.execute(
+                "UPDATE messages SET role='user', text=?, uuid='synthetic', title=? WHERE seq=1",
+                (synthetic, synthetic),
+            )
+            connection.execute(
+                "INSERT INTO messages (session_id, seq, role, text, uuid, title) "
+                "VALUES ('session', 2, 'assistant', 'visible answer', 'assistant', ?)",
+                (synthetic,),
+            )
+            connection.execute(
+                "UPDATE sessions SET title=?, user_message_count=1, assistant_message_count=1",
+                (synthetic,),
+            )
+
+        self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
+        with contextlib.closing(connect_readonly(self.db)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM index_meta WHERE key='parser_version'"
+            ).fetchone()[0], '1')
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'staleoutput'"
+            ).fetchone()[0], 0)
 
     def test_other_database_refused_and_read_does_not_create(self):
         self.write([self.event('user')])
