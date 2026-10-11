@@ -45,3 +45,8 @@ The release audit checks tracked files and unignored additions for common runtim
 - Keep all storage and serving local by default; do not add automatic transmission or memory synchronization.
 - Update tests with behavior changes, and update `README.md` when setup, commands, privacy behavior, or supported scope changes.
 - Prefer conventional commits where practical, such as `feat(index): ...`, `fix(audit): ...`, or `chore(ci): ...`.
+
+For MCP changes, use Python 3.10+ with `python -m pip install ".[mcp]"`,
+then run the same unittest suite. Without the optional SDK, the real stdio
+tests are skipped; structured retrieval tests still run on Python 3.9. CI installs
+the optional SDK for Python 3.12 so protocol coverage cannot silently skip.

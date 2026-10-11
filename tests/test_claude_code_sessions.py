@@ -51,6 +51,30 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
         self.assertIn('Named session', output.getvalue())
         self.assertIn('visible answer', output.getvalue())
 
+    def test_recursive_refresh_excludes_separate_subagent_transcripts(self):
+        self.write([self.event('user'),
+                    self.event('sidechain', 'assistant', 'main sidechain', isSidechain=True)])
+        subagents = self.root / 'session' / 'subagents'
+        subagents.mkdir(parents=True)
+        child = subagents / 'agent-worker.jsonl'
+        child.write_text(json.dumps(self.event('child', 'assistant', 'subagentonly')))
+        original_child = child.read_bytes()
+
+        self.assertEqual(index_sessions(self.root, self.db), (1, 0, 2))
+        self.assertEqual(index_sessions(self.root, self.db), (0, 1, 2))
+        with contextlib.closing(connect_readonly(self.db)) as connection:
+            rows = connection.execute('SELECT uuid, is_sidechain FROM messages ORDER BY seq').fetchall()
+            self.assertEqual([tuple(row) for row in rows], [('user', 0), ('sidechain', 1)])
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'subagentonly'"
+            ).fetchone()[0], 0)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(search(['searchable', '--db', str(self.db),
+                                     '--input', str(self.root)]), 0)
+        self.assertIn('searchable request', output.getvalue())
+        self.assertEqual(child.read_bytes(), original_child)
+
     def test_compaction_summary_is_not_user_text(self):
         self.write([
             self.event('summary', content='generatedsummary', isCompactSummary=True),

@@ -9,7 +9,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from ..codex.session_index import SCHEMA_SQL
+from ..codex.session_index import SCHEMA_SQL, repair_session_fts
 
 VERSION = "1"
 
@@ -93,11 +93,15 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
 
     Returns indexed-file, unchanged-file, and total retained-message counts. Each
     file is replaced in one transaction; a failure preserves its previous index.
+    Recursive discovery excludes separate subagent transcripts because they reuse
+    the parent session ID. Sidechain messages in the main transcript are retained.
     """
     input_path, db_path = input_path.expanduser().resolve(), db_path.expanduser().resolve()
     if not input_path.exists():
         raise ValueError(f"Session input does not exist: {input_path}")
-    files = [input_path] if input_path.is_file() else sorted(input_path.rglob("*.jsonl"))
+    files = ([input_path] if input_path.is_file() else
+             sorted(path for path in input_path.rglob("*.jsonl")
+                    if path.parent.name != "subagents"))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path)
     try:
@@ -112,6 +116,7 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
             connection.execute("ALTER TABLE messages ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0")
             connection.executemany("INSERT INTO index_meta VALUES (?, ?)", [("provider", "claude_code"), ("schema_version", VERSION)])
             connection.commit()
+        repair_session_fts(connection)
         connection.execute("PRAGMA foreign_keys=ON")
         indexed = skipped = 0
         for path in files:

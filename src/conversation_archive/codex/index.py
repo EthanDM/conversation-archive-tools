@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Index the configured shared Codex-session archive instead of local sessions",
     )
+    parser.add_argument("--include-local", action="store_true", help="With --shared, include current local sessions without publishing them")
     parser.add_argument("--db", default=default_db_path(), help="Separate Codex session SQLite database")
     parser.add_argument("--reset", action="store_true", help="Discard and rebuild the Codex session database")
     parser.add_argument("--no-incremental", action="store_true", help="Reindex every source file without deleting the database")
@@ -29,6 +30,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.shared and args.input:
         parser.error("--shared cannot be combined with --input")
+    if args.include_local and not args.shared:
+        parser.error("--include-local requires --shared")
     input_path = args.input or (default_shared_input_path() if args.shared else default_input_path())
     indexed, skipped, messages = index_sessions(
         Path(input_path).expanduser(),
@@ -36,6 +39,7 @@ def main(argv: list[str]) -> int:
         reset=args.reset,
         incremental=not args.no_incremental,
         limit=args.limit,
+        additional_inputs=(Path(default_input_path()),) if args.include_local else (),
     )
     print(f"done: indexed {indexed} sessions, skipped {skipped} unchanged sessions, retained {messages} messages")
     return 0
