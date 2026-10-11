@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
-import sys
 import sqlite3
+import sys
 from pathlib import Path
 
 from .paths import default_db_path, default_input_path
