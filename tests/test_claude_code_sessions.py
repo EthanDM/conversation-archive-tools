@@ -54,7 +54,7 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'secretthought OR secrettool OR secretresult'").fetchone()[0], 0)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertEqual(search(['searchable', '--db', str(self.db), '--context', '1']), 0)
+            self.assertEqual(search(['searchable', '--db', str(self.db), '--no-refresh', '--context', '1']), 0)
             self.assertEqual(show(['--session', 'session', '--db', str(self.db)]), 0)
         self.assertIn('Named session', output.getvalue())
         self.assertIn('visible answer', output.getvalue())
@@ -209,7 +209,7 @@ class ClaudeCodeSessionsTest(unittest.TestCase):
         self.assertEqual(index_sessions(self.source, self.db), (1, 0, 1))
         error_output = io.StringIO()
         with contextlib.redirect_stderr(error_output):
-            self.assertEqual(search(['"', '--db', str(self.db)]), 2)
+            self.assertEqual(search(['"', '--db', str(self.db), '--no-refresh']), 2)
         self.assertIn('Claude Code search failed: unterminated string',
                       error_output.getvalue())
 

@@ -7,8 +7,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .paths import default_db_path
+from .paths import default_db_path, default_input_path
 from .session_index import connect_readonly as connect_sqlite
+from .session_index import index_sessions
 from ..cli import format_snippet
 
 
@@ -59,16 +60,25 @@ def search(db_path: Path, query: str, *, limit: int, context: int, width: int, l
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Search the separate local Claude Code session SQLite FTS index.")
     parser.add_argument("query", help="FTS query; supports phrases and boolean operators")
-    parser.add_argument("--db", default=default_db_path(), help="Claude Code session SQLite database")
+    parser.add_argument("--db", default=None, help="Claude Code session SQLite database")
+    parser.add_argument("--input", help="Session source directory or JSONL file to refresh")
+    parser.add_argument("--no-refresh", action="store_true", help="Search the existing snapshot without writing to the index")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--context", type=int, default=0, help="Messages before/after each hit")
     parser.add_argument("--width", type=int, default=100)
     parser.add_argument("--lines", type=int, default=10)
     args = parser.parse_args(argv)
+    db_path = Path(args.db or default_db_path()).expanduser()
+    if args.no_refresh and args.input:
+        parser.error("--input cannot be combined with --no-refresh")
+    if args.db and not args.input and not args.no_refresh:
+        parser.error("custom --db requires --input or --no-refresh")
     try:
-        return search(Path(args.db).expanduser(), args.query, limit=args.limit,
-                      context=args.context, width=args.width, lines=args.lines)
-    except (ValueError, OSError, sqlite3.Error) as error:
+        if not args.no_refresh:
+            input_path = Path(args.input or default_input_path()).expanduser()
+            index_sessions(input_path, db_path)
+        return search(db_path, args.query, limit=args.limit, context=args.context, width=args.width, lines=args.lines)
+    except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Claude Code search failed: {error}", file=sys.stderr)
         return 2
 
