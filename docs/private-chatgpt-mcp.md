@@ -35,3 +35,19 @@ local storage, without credentials or unnecessary transcript excerpts.
 After code updates, reinstall the package in the service's environment and restart
 the dedicated LaunchAgent. Refresh ChatGPT's discovered tools if the interface
 changes. Do not restart or replace other tunnel services.
+
+## Search progress without a widget
+
+All tool descriptors supply ChatGPT `openai/toolInvocation/invoking` and
+`openai/toolInvocation/invoked` status labels. Search responses also include
+`search_summary`, the exact `search_query`, and `search_filters`, alongside the
+existing results. Summaries describe returned pages and continuation offsets;
+only topic search reports full filtered match totals. Unavailable provider queries
+are distinct from empty pages. Historical documents do not inherit role/date
+filters, and no summary claims complete account coverage.
+
+Server instructions ask the assistant to give one short progress sentence after
+each search using this summary. No widget is required. ChatGPT controls whether
+and where status labels and narration appear; returning a summary does not force
+it into the expanded working view. Refresh the installed plugin's discovered tools
+and instructions after activating this change.
