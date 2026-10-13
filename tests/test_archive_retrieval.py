@@ -232,7 +232,7 @@ class RetrievalTests(unittest.TestCase):
                 async with ClientSession(read,write) as client:
                     await client.initialize()
                     tools=(await client.list_tools()).tools
-                    self.assertEqual({t.name for t in tools},{'archive_status','search_conversations','read_conversation','read_message_context','list_conversations','search_all_conversations','refresh_local_sessions','search_topic','search_historical','read_historical_document'})
+                    self.assertEqual({t.name for t in tools},{'archive_status','search_conversations','search_within_conversation','read_conversation','read_message_context','list_conversations','search_all_conversations','refresh_local_sessions','search_topic','search_historical','read_historical_document'})
                     self.assertTrue(all(t.annotations.readOnlyHint for t in tools if t.name != 'refresh_local_sessions'))
                     refresh_tool=next(t for t in tools if t.name == 'refresh_local_sessions')
                     self.assertFalse(refresh_tool.annotations.readOnlyHint)
@@ -241,6 +241,14 @@ class RetrievalTests(unittest.TestCase):
                         result=await client.call_tool('search_conversations',{'provider':provider,'query':'needle','limit':1})
                         self.assertFalse(result.isError)
                         self.assertTrue(result.structuredContent['has_more'])
+                        scoped=await client.call_tool('search_within_conversation',{'provider':provider,'conversation_id':'conv','query':'needle','limit':1,'include_text':False})
+                        self.assertFalse(scoped.isError)
+                        self.assertTrue(scoped.structuredContent['has_more'])
+                        reference=scoped.structuredContent['items'][0]
+                        self.assertNotIn('text',reference)
+                        scoped_text=await client.call_tool('search_within_conversation',{'provider':provider,'conversation_id':'conv','query':'needle','role':'user'})
+                        self.assertFalse(scoped_text.isError)
+                        self.assertIn('text_offset',scoped_text.structuredContent['items'][0])
                         readback=await client.call_tool('read_conversation',{'provider':provider,'conversation_id':'conv'})
                         self.assertEqual(len(readback.structuredContent['items']),2)
                         context=await client.call_tool('read_message_context',{'provider':provider,'message_index_id':1})
@@ -260,6 +268,16 @@ class RetrievalTests(unittest.TestCase):
                     combined_old=await client.call_tool('search_all_conversations',{'query':'historicalneedle','include_historical':True})
                     self.assertEqual(len(combined_old.structuredContent['historical']['items']),2)
                     self.assertFalse(combined_old.structuredContent['historical']['role_and_date_filters_applied'])
+                    missing=await client.call_tool('search_within_conversation',{'provider':'codex','conversation_id':'missing','query':'needle'})
+                    self.assertFalse(missing.isError)
+                    self.assertFalse(missing.structuredContent['conversation_available'])
+                    empty=await client.call_tool('search_within_conversation',{'provider':'codex','conversation_id':'conv','query':'absent'})
+                    self.assertFalse(empty.isError)
+                    self.assertTrue(empty.structuredContent['conversation_available'])
+                    for args in ({'provider':'codex','conversation_id':'conv','query':'"'},
+                                 {'provider':'codex','conversation_id':'conv','query':'needle','limit':51},
+                                 {'provider':'codex','conversation_id':'conv','query':'needle','start_date':'bad'}):
+                        self.assertTrue((await client.call_tool('search_within_conversation',args)).isError)
                     self.assertTrue((await client.call_tool('refresh_local_sessions',{'provider':'chatgpt'})).isError)
                     for args in ({'provider':'unknown','query':'needle'},{'provider':'codex','query':'needle','limit':51},{'provider':'codex','query':'"'}):
                         self.assertTrue((await client.call_tool('search_conversations',args)).isError)

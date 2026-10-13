@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 import sqlite3
 import json
+import re
 import time
 
 from .chatgpt import paths as chatgpt_paths
@@ -114,6 +115,94 @@ def search_conversations(provider: str, query: str, *, role: str | None = None,
         rows = connection.execute(sql + " ORDER BY relevance_score IS NULL, relevance_score, timestamp DESC, message_index_id DESC LIMIT ? OFFSET ?",
                                   [text_query(query), literal_pattern(query)] + args + [limit + 1, offset]).fetchall()
         return {"provider": provider, "scope": "indexed_messages_only", **page_result(rows, limit, offset, 1000)}
+
+
+def _query_passage(text: str, query: str, max_chars: int = 1000) -> dict:
+    """Return an exact bounded span near query words, with a raw-text continuation offset.
+
+    Window choice is a keyword heuristic, not an FTS parser or evidence confidence.
+    SQL establishes the text match; this only chooses where to begin reading it.
+    """
+    words = list(dict.fromkeys(word.lower() for word in re.findall(r"\w+", query)
+                               if word.upper() not in {"AND", "OR", "NOT", "NEAR"}))
+    starts = {0}
+    for word in words:
+        match = re.search(re.escape(word), text, flags=re.IGNORECASE)
+        if match:
+            starts.add(max(0, match.start() - max_chars // 4))
+    start = max(sorted(starts), key=lambda pos: sum(word in text[pos:pos + max_chars].lower() for word in words))
+    end = min(len(text), start + max_chars)
+    return {"text": text[start:end], "text_offset": start, "text_length": len(text),
+            "truncated": start > 0 or end < len(text),
+            "next_text_offset": end if end < len(text) else None}
+
+
+def search_within_conversation(provider: str, conversation_id: str, query: str, *,
+                               role: str | None = None, start_date: str | None = None,
+                               end_date: str | None = None, limit: int = 10, offset: int = 0,
+                               include_text: bool = True, path: Path | None = None) -> dict:
+    """Search message text in one exact indexed conversation, without title fallback.
+
+    FTS syntax, role, inclusive source-calendar dates and pagination follow search_conversations.
+    Scores are provider-local BM25; each text result has an exact span capped at 1000
+    characters and offsets usable by read_message_context. include_text=False omits
+    transcript text and its span fields. Missing conversations are flagged separately
+    from no matches; index/FTS errors propagate. No branches or user commitments are inferred.
+    """
+    validate_page(limit, offset)
+    search_predicate(query, role, start_date, end_date)
+    if not isinstance(conversation_id, str) or not conversation_id or len(conversation_id) > 200:
+        raise ValueError("conversation_id must contain 1–200 characters")
+    if type(include_text) is not bool:
+        raise ValueError("include_text must be boolean")
+    conditions = ["conversation_id=?"]
+    arguments = [conversation_id]
+    for condition, value in (("role=?", role), ("substr(timestamp,1,10)>=?", start_date),
+                             ("substr(timestamp,1,10)<=?", end_date)):
+        if value is not None:
+            conditions.append(condition)
+            arguments.append(value)
+    with open_index(provider, path) as connection:
+        normalized = projection(provider, connection)
+        # An empty scope can skip FTS evaluation; validate syntax without returning a global hit.
+        connection.execute("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ? LIMIT 1",
+                           (text_query(query),)).fetchone()
+        if provider == "claude":
+            table, identifier = "conversations", "uuid"
+        elif provider == "chatgpt":
+            table, identifier = "conversations", "conversation_id"
+        else:
+            table, identifier = "sessions", "session_id"
+        exists = connection.execute(f"SELECT 1 FROM {table} WHERE {identifier}=? LIMIT 1",
+                                    (conversation_id,)).fetchone() is not None
+        fields = ["message_index_id", "conversation_id", "seq", "role", "timestamp", "title",
+                  "source", "message_id", "parent_id", "is_sidechain", "node_id", "cwd"]
+        if include_text:
+            fields.append("text")
+        selected = ",".join("n." + field for field in fields)
+        # Keep BM25 inside the FTS cursor and intersect the conversation before paging.
+        sql = f"""WITH hits AS (
+            SELECT rowid,bm25(messages_fts) AS score FROM messages_fts
+            WHERE messages_fts MATCH ? AND rowid IN (
+                SELECT message_index_id FROM ({normalized}) WHERE {' AND '.join(conditions)}
+            ) LIMIT -1
+        ) SELECT {selected},h.score AS relevance_score FROM ({normalized}) n
+            JOIN hits h ON h.rowid=n.message_index_id
+            ORDER BY relevance_score,julianday(timestamp) DESC,message_index_id DESC
+            LIMIT ? OFFSET ?"""
+        rows = connection.execute(sql, [text_query(query), *arguments, limit + 1, offset]).fetchall()
+        items = []
+        for row in rows[:limit]:
+            item = dict(row)
+            text = item.pop("text", None) or ""
+            item["match_type"] = "message"
+            if include_text:
+                item.update(_query_passage(text, query))
+            items.append(item)
+        return {"provider": provider, "conversation_id": conversation_id,
+                "scope": "indexed_message_text_in_conversation", "conversation_available": exists,
+                "include_text": include_text, "items": items, "limit": limit, "offset": offset,
+                "has_more": len(rows) > limit, "next_offset": offset + limit if len(rows) > limit else None}
 
 
 def read_conversation(provider: str, conversation_id: str, *, limit: int = 20,
