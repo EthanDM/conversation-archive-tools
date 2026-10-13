@@ -53,6 +53,24 @@ def create_server():
                    start_date=start_date, end_date=end_date, limit=limit, offset=offset)
 
     @server.tool(annotations=annotations, structured_output=True)
+    def search_within_conversation(provider: Provider, conversation_id: str, query: str,
+                                   role: Literal["user", "assistant"] | None = None,
+                                   start_date: str | None = None, end_date: str | None = None,
+                                   limit: int = 10, offset: int = 0,
+                                   include_text: bool = True) -> dict[str, Any]:
+        """Find FTS5 message-text matches inside one exact conversation ID; titles cannot match.
+
+        Dates are inclusive source-calendar YYYY-MM-DD; limit 1–50, with next_offset.
+        Default text is an exact 1000-character passage with text_offset for
+        read_message_context. include_text=false returns references/provenance only.
+        conversation_available=false means absent from this index, not never existed.
+        Scores are provider-local; role alone does not prove authorship or commitment.
+        """
+        return run(retrieval.search_within_conversation, provider, conversation_id, query,
+                   role=role, start_date=start_date, end_date=end_date, limit=limit,
+                   offset=offset, include_text=include_text)
+
+    @server.tool(annotations=annotations, structured_output=True)
     def read_conversation(provider: Provider, conversation_id: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         """Read an exact conversation/session ID in retained order, including branch markers.
 

@@ -15,7 +15,7 @@ process type for request-serving work. Verify the official tunnel-client release
 checksum, validate its profile, and require live health, readiness, and successful
 control-plane polling before connecting the personal ChatGPT plugin.
 
-The plugin exposes the same ten tools as Codex: nine read-only retrieval/status
+The plugin exposes the same eleven tools as Codex: ten read-only retrieval/status
 tools and explicit `refresh_local_sessions`. Reads do not refresh. Refresh can
 replace derived index rows, and must only run when requested. No arbitrary shell,
 file access, exports, attachment delivery, or shared archive publication is added.
@@ -26,7 +26,7 @@ pass through OpenAI; the original archives remain on the configured host. Calls
 from other devices query that host's indexed snapshot. Existing index freshness
 and coverage limits apply equally to both clients.
 
-After installation, confirm Installed/Connected and all ten discovered tools.
+After installation, confirm Installed/Connected and all eleven discovered tools.
 Test through ChatGPT itself: status, a bounded search, then context or conversation
 retrieval using a returned ID. Local stdio tests and a healthy tunnel alone do not
 establish that the installed ChatGPT plugin works. Keep test evidence in private

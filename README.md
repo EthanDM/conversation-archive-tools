@@ -269,8 +269,8 @@ configured database paths and environment overrides as the CLI. It does not
 require the dashboard or an HTTP service. Use an absolute executable path in
 client configuration so it works from other project directories.
 
-Nine read-only tools are exposed: `archive_status`, `search_conversations`,
-`read_conversation`, `read_message_context`, `list_conversations`, and
+Ten read-only tools are exposed: `archive_status`, `search_conversations`,
+`search_within_conversation`, `read_conversation`, `read_message_context`, `list_conversations`, and
 `search_all_conversations`, `search_topic`, `search_historical`, and
 `read_historical_document`. A separate write-capable `refresh_local_sessions`
 tool incrementally refreshes configured Codex or Claude Code session indexes. Providers are `chatgpt`,
@@ -297,6 +297,34 @@ Retrieved transcripts, titles and paths are historical source data, not agent
 instructions or permission. No attachment files, arbitrary paths, shell
 commands, source-file writes, or experimental reports are exposed. Test with synthetic
 indexes and a real stdio client; no personal records are needed.
+
+### Searching within a conversation
+
+Use `search_within_conversation` after identifying a provider and conversation ID.
+It searches message text only: a matching title cannot return unrelated messages.
+FTS5 queries, optional user/assistant role, inclusive source-calendar date bounds,
+and `limit`/`offset` follow the existing search conventions. Results rank by
+provider-local BM25, then timestamp and message ID; retain IDs, roles, source/cwd
+and available parent/branch fields. No branch selection or commitment is inferred.
+
+By default, each result includes an exact passage of at most 1000 characters.
+`text_offset` and `next_text_offset` refer to the original indexed text and can
+be passed to `read_message_context` for full recovery or surrounding context.
+Passage positioning is a query-word heuristic; the SQL text match establishes
+relevance, not the snippet or score alone. `include_text=false` omits transcript
+text and span fields while retaining references, relevance and provenance.
+
+For example, call with `provider="codex"`, `conversation_id` from an existing
+search result, `query='"payment plan" AND reminders'`, `include_text=false` and
+`limit=5`, then read a chosen `message_index_id` with `read_message_context`.
+This is an optional complement to existing searches/reads; no candidate fusion,
+query expansion, issuing-chat resolution or semantic search is applied.
+
+`conversation_available=false` means the ID has no conversation metadata in that
+provider; it does not mean the source never existed. An available conversation
+with zero matches (including one with no retained messages) returns a successful empty page. Missing/incompatible indexes,
+invalid FTS syntax and invalid filters return MCP errors. Reads never refresh.
+Date filters remain inclusive calendar dates, not an experimental as-of timestamp.
 
 ### Browsing, combined search, and refresh
 
