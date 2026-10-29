@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .paths import default_db_path, default_input_path, default_shared_input_path
 from .session_index import index_sessions
+from .source_roots import local_additional_roots, protected_local_roots
 from ..cli import format_snippet
 
 
@@ -85,7 +86,13 @@ def main(argv: list[str]) -> int:
                     metadata = dict(connection.execute("SELECT key, value FROM index_meta"))
                 if metadata.get("provider") not in {None, "codex"} or "indexer_version" not in metadata:
                     raise ValueError("Database is not a supported Codex session index")
-            index_sessions(input_path, db_path)
+            additional_inputs = ()
+            protected_missing_roots = ()
+            if not args.input and not args.shared:
+                additional_inputs = local_additional_roots(input_path, db_path, preserve_shared=True)
+                protected_missing_roots = protected_local_roots(input_path, additional_inputs)
+            index_sessions(input_path, db_path, additional_inputs=additional_inputs, preserve_scope=True,
+                           protected_missing_roots=protected_missing_roots)
         return search(db_path, args.query, limit=args.limit, context=args.context, width=args.width, lines=args.lines)
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Codex search failed: {error}", file=sys.stderr)

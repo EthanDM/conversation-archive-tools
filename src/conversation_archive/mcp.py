@@ -193,8 +193,10 @@ def create_server():
         """Explicitly refresh configured local session indexes only when the user requests it.
 
         Incremental; writes indexes, never source files. No arbitrary paths, export imports,
-        reset or publishing. Codex removes missing source rows; Claude Code retains them.
-        Use include_shared=true for configured shared plus current local Codex history.
+        reset or publishing. Codex retains missing local rows when active and archived
+        roots are paired; other missing Codex rows are removed. Claude Code retains them.
+        Codex local history includes archived sessions when available.
+        Use include_shared=true to include configured shared history as well.
         Other out-of-scope sources are refused. Failures may leave partially refreshed files;
         retry to finish. Counts describe this refresh, not newly created conversations.
         """

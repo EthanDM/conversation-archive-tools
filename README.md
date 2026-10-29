@@ -89,7 +89,7 @@ Search and transcript commands read existing databases without creating or chang
 Codex sessions are indexed separately from ChatGPT history:
 
 ```bash
-# Initial build; reads ~/.codex/sessions by default.
+# Initial build; reads local and available archived Codex sessions by default.
 conversation-archive-index-codex --reset
 
 # Later runs reindex only changed JSONL or compressed JSONL files.
@@ -100,7 +100,7 @@ conversation-archive-show-codex --title "personal site" --list
 conversation-archive-show-codex --session <session-id> --max-chars 2000
 ```
 
-Codex indexing and publishing support both `.jsonl` and Zstandard-compressed `.jsonl.zst` sessions. Compression requires the `zstandard` package installed with this project. A refresh fails without committing changes if a compressed session is corrupt or incomplete. A reset builds a replacement first and requires the old index to be free of SQLite sidecars; close other connections and allow SQLite to checkpoint before retrying. Do not run filesystem restores, copies, or synchronization that write the index or its sidecars while reset is running: those operations bypass SQLite locks and can leave the rebuilt index inconsistent. The default input remains `~/.codex/sessions`; configure other roots explicitly if needed.
+Codex indexing and publishing support both `.jsonl` and Zstandard-compressed `.jsonl.zst` sessions. Compression requires the `zstandard` package installed with this project. A refresh fails without committing changes if a compressed session is corrupt or incomplete. A reset builds a replacement first and requires the old index to be free of SQLite sidecars; close other connections and allow SQLite to checkpoint before retrying. Do not run filesystem restores, copies, or synchronization that write the index or its sidecars while reset is running: those operations bypass SQLite locks and can leave the rebuilt index inconsistent. The default local input is `~/.codex/sessions`; local refresh also includes `~/.codex/archived_sessions` when available. Set `CODEX_SESSION_ARCHIVED_INPUT` to select a different archived-session directory, including with a custom local source. An explicitly configured or previously indexed archived directory must exist for refresh to proceed. When active and archived roots are paired, incremental refresh retains missing local records so sessions moving between roots remain searchable; use an explicit reset to remove records whose source files were deleted.
 
 The Codex index retains filtered user and assistant text for search. It excludes developer/system wrappers, injected skill instructions, function calls/results, reasoning, terminal/event logs, and images. Override defaults with `CODEX_SESSION_INPUT` and `CODEX_SESSION_DB`.
 
@@ -349,13 +349,12 @@ file, unchanged file, and retained message counts plus completion time. Source
 files are never modified. Reads stay independent and never trigger refresh.
 
 Refresh can change message IDs and replaces changed-file index rows. Codex's
-indexer also removes rows whose sources vanished; Claude Code retains missing
-source history. The MCP therefore marks refresh as write-capable and potentially
+indexer removes missing shared-source rows, but retains missing local rows when active and archived roots are paired; Claude Code retains missing source history. The MCP therefore marks refresh as write-capable and potentially
 destructive, and refuses a Codex index with source paths outside its selected configured
-inputs. For shared plus current local history, explicitly use
+inputs. For shared plus local and archived history, explicitly use
 `refresh_local_sessions(provider="codex", include_shared=true)` or the CLI
 `conversation-archive-index-codex --shared --include-local`. Both read the source
-union without publishing local files. Without this option, shared indexes are
+union without publishing local files. Default CLI refreshes retain a previously indexed configured shared root. Explicit `--input` and `--shared` select their specified scope; an incremental CLI refresh refuses to narrow an existing index. Use a separate database or an explicit index `--reset` to change scopes. Without this option, shared indexes are
 refused by the local-only refresh tool. Concurrent refreshes in one MCP process are
 refused. A failed refresh may have already committed some file updates; retry
 finishes incremental work rather than rolling back the entire refresh.
@@ -398,9 +397,9 @@ Codex indexer version 2 excludes machine approval-review sessions identified by
 Ordinary human review requests and non-guardian subagent history remain searchable.
 Runtime open-Page wrappers are excluded. A filter-version change reparses unchanged
 source files on the next refresh so old pollution is removed; reindexing may change
-message IDs. Existing missing sources still follow the indexer's documented policy.
+message IDs. Missing sources follow the indexer's documented retention policy.
 For configured shared Codex history, use `include_shared=true` on the refresh
-tool to also include current local sessions, or use the CLI's
+tool to include local and archived sessions, or use the CLI's
 `--shared --include-local` options. Plain `--shared` retains its original
 shared-only behavior. Unavailable input roots fail before modifying the index.
 Duplicate session IDs resolve to one indexed session using the existing source
