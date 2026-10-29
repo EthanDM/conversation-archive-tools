@@ -7,12 +7,18 @@ events, and injected instructions are intentionally excluded before storage.
 from __future__ import annotations
 
 import datetime as dt
+import errno
+import fcntl
 import json
+import os
 import re
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
+
+from .session_files import is_session_file, session_lines
 
 
 INDEXER_VERSION = "2"
@@ -184,59 +190,68 @@ def _title_from_messages(messages: list[RetainedMessage], session_id: str) -> st
 def parse_session_file(path: Path) -> Optional[ParsedSession]:
     """Parse one Codex JSONL file, skipping malformed records and excluded content.
 
-    Returns ``None`` when the file has no stable session ID. Repeated metadata
-    records remain part of the same session rather than creating duplicates.
+    Excluded sessions and plain files without an ID return ``None``. Compressed
+    files without an ID raise ValueError to protect previously indexed history.
+    Repeated metadata records remain part of the same session.
     """
     session_id: Optional[str] = None
     cwd = ""
     messages: list[RetainedMessage] = []
     first_time: Optional[str] = None
     last_time: Optional[str] = None
+    excluded = False
 
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
+    for line in session_lines(path):
+        if excluded:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        timestamp = _normalise_timestamp(event.get("timestamp"))
+        if event.get("type") == "session_meta":
+            source = payload.get("source")
+            guardian = (isinstance(source, dict)
+                        and isinstance(source.get("subagent"), dict)
+                        and source["subagent"].get("other") == "guardian")
+            if payload.get("thread_source") == "guardian_review" or guardian:
+                excluded = True
                 continue
-            if not isinstance(event, dict):
-                continue
-            payload = event.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            timestamp = _normalise_timestamp(event.get("timestamp"))
-            if event.get("type") == "session_meta":
-                source = payload.get("source")
-                guardian = (isinstance(source, dict)
-                            and isinstance(source.get("subagent"), dict)
-                            and source["subagent"].get("other") == "guardian")
-                if payload.get("thread_source") == "guardian_review" or guardian:
-                    return None
-                candidate_id = payload.get("id")
-                if isinstance(candidate_id, str) and candidate_id:
-                    session_id = session_id or candidate_id
-                candidate_cwd = payload.get("cwd")
-                if isinstance(candidate_cwd, str) and candidate_cwd:
-                    cwd = cwd or candidate_cwd
-                continue
-            if event.get("type") != "response_item" or payload.get("type") != "message":
-                continue
-            role = payload.get("role")
-            if role not in {"user", "assistant"}:
-                continue
-            if role == "user" and any(
-                is_approval_envelope(block.get("text"))
-                for block in payload.get("content", []) if isinstance(block, dict)
-            ):
-                return None
-            text = _message_text(payload, role)
-            if not text:
-                continue
-            messages.append(RetainedMessage(role=role, create_time_iso=timestamp, text=text))
-            first_time = first_time or timestamp
-            last_time = timestamp or last_time
+            candidate_id = payload.get("id")
+            if isinstance(candidate_id, str) and candidate_id:
+                session_id = session_id or candidate_id
+            candidate_cwd = payload.get("cwd")
+            if isinstance(candidate_cwd, str) and candidate_cwd:
+                cwd = cwd or candidate_cwd
+            continue
+        if event.get("type") != "response_item" or payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "user" and any(
+            is_approval_envelope(block.get("text"))
+            for block in payload.get("content", []) if isinstance(block, dict)
+        ):
+            excluded = True
+            continue
+        text = _message_text(payload, role)
+        if not text:
+            continue
+        messages.append(RetainedMessage(role=role, create_time_iso=timestamp, text=text))
+        first_time = first_time or timestamp
+        last_time = timestamp or last_time
 
+    if excluded:
+        return None
     if not session_id:
+        if path.name.endswith(".jsonl.zst"):
+            raise ValueError(f"Compressed Codex session has no session ID: {path}")
         return None
     return ParsedSession(
         session_id=session_id,
@@ -254,17 +269,21 @@ def iter_session_files(input_path: Path) -> Iterator[Path]:
         return
     yield from (
         path
-        for path in sorted(input_path.rglob("*.jsonl"))
-        if not path.is_symlink() and path.resolve().is_relative_to(input_path)
+        for path in sorted(input_path.rglob("*.jsonl*"))
+        if is_session_file(path) and not path.is_symlink() and path.resolve().is_relative_to(input_path)
     )
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.executescript(SCHEMA_SQL)
-    repair_session_fts(connection)
-    return connection
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executescript(SCHEMA_SQL)
+        repair_session_fts(connection)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 
@@ -386,8 +405,10 @@ def index_sessions(
 
     Incremental mode trusts the source file's size and nanosecond mtime; changed
     files replace prior rows for either their path or their session ID. ``reset``
-    removes only the target SQLite database and its WAL sidecars. Explicit additional
-    inputs form one source union; all roots must exist before any index writes.
+    builds a separate index and preserves the existing file if rebuilding fails.
+    Callers must prevent raw file restores or copies at the index path throughout
+    reset; SQLite locks cannot coordinate with operations that bypass SQLite.
+    Explicit additional inputs form one source union; all roots must exist before writes.
     """
     input_path = input_path.expanduser().resolve()
     additional_inputs = tuple(path.expanduser().resolve() for path in additional_inputs)
@@ -401,20 +422,124 @@ def index_sessions(
     if not input_path.is_file() and not input_path.is_dir():
         raise ValueError(f"Codex session input is not a file or directory: {input_path}")
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    if reset:
-        for suffix in ("", "-wal", "-shm"):
-            db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
     all_paths = sorted({path for root in (input_path, *additional_inputs) for path in iter_session_files(root)})
     source_paths = {str(path.resolve()) for path in all_paths}
     paths = all_paths
     if limit is not None:
         paths = paths[:limit]
+    if reset:
+        return _reset_index(db_path, input_path, additional_inputs, source_paths, paths, limit)
     connection = connect(db_path)
+    try:
+        return _refresh_index(connection, input_path, additional_inputs, source_paths, paths, limit, incremental, False)
+    finally:
+        connection.close()
+
+
+def _reset_index(
+    db_path: Path, input_path: Path, additional_inputs: tuple[Path, ...],
+    source_paths: set[str], paths: list[Path], limit: Optional[int],
+) -> tuple[int, int, int]:
+    """Rebuild separately and replace the index only while other SQLite writers are excluded."""
+    original = db_path.stat() if db_path.exists() else None
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{db_path.name}.", suffix=".tmp", dir=db_path.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        connection = connect(temporary)
+        try:
+            result = _refresh_index(connection, input_path, additional_inputs, source_paths, paths, limit, False, False)
+        finally:
+            connection.close()
+        if original is None:
+            _install_missing_index(db_path, temporary)
+            return result
+        _replace_index_under_lock(db_path, temporary, original)
+        return result
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _install_missing_index(db_path: Path, temporary: Path) -> None:
+    """Install under a SQLite lock, rejecting sidecars that appear during linking."""
+    connection = sqlite3.connect(temporary, timeout=0)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        _check_index_sidecars(db_path)
+        # Linking fails if another process creates the main database meanwhile.
+        os.link(temporary, db_path)
+        try:
+            _check_index_sidecars(db_path)
+        except BaseException:
+            if db_path.exists() and os.path.samefile(db_path, temporary):
+                db_path.unlink()
+            raise
+    finally:
+        connection.close()
+
+
+def _check_index_sidecars(db_path: Path) -> None:
+    """Refuse to install a new index while SQLite recovery files remain."""
+    for suffix in ("-wal", "-shm", "-journal"):
+        if db_path.with_name(db_path.name + suffix).exists():
+            raise ValueError(f"Cannot safely reset an index with SQLite sidecars: {db_path}")
+
+
+def _replace_index_under_lock(db_path: Path, temporary: Path, original: os.stat_result) -> None:
+    """Hold SQLite's exclusive lock across validation and replacement of an existing index."""
+    lock_connection = None
+    lock_fd = None
+    _check_index_sidecars(db_path)
+    try:
+        try:
+            lock_connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0)
+            lock_connection.execute("BEGIN EXCLUSIVE")
+        except sqlite3.DatabaseError as error:
+            if lock_connection is not None:
+                lock_connection.close()
+                lock_connection = None
+            if not any(message in str(error).lower() for message in (
+                "file is not a database", "database disk image is malformed", "malformed database schema",
+            )):
+                raise
+            # SQLite cannot open a corrupt file, so acquire its POSIX lock bytes directly.
+            lock_fd = os.open(db_path, os.O_RDWR)
+            try:
+                fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 512, 0x40000000, os.SEEK_SET)
+            except OSError as lock_error:
+                if lock_error.errno in (errno.EACCES, errno.EAGAIN):
+                    raise ValueError(f"Cannot reset an index while it is in use: {db_path}") from lock_error
+                raise
+        _check_index_sidecars(db_path)
+        current = db_path.stat()
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            original.st_dev, original.st_ino, original.st_size, original.st_mtime_ns
+        ):
+            raise ValueError(f"Cannot reset an index that changed during recovery: {db_path}")
+        os.replace(temporary, db_path)
+    finally:
+        if lock_connection is not None:
+            lock_connection.close()
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _refresh_index(
+    connection: sqlite3.Connection, input_path: Path, additional_inputs: tuple[Path, ...],
+    source_paths: set[str], paths: list[Path], limit: Optional[int], incremental: bool, reset: bool,
+) -> tuple[int, int, int]:
+    """Update one index transaction and return indexed, skipped, and message counts."""
+    # All removals and replacements share one transaction: an unreadable compressed
+    # replacement must not erase the prior searchable session.
     cursor = connection.cursor()
+    prior_paths = {row[0] for row in cursor.execute("SELECT source_path FROM sessions")}
+    if reset:
+        cursor.execute("DELETE FROM sessions")
+        cursor.execute("DELETE FROM index_meta")
+        incremental = False
     version = cursor.execute("SELECT value FROM index_meta WHERE key='indexer_version'").fetchone()
     if version != (INDEXER_VERSION,):
         if limit is not None and cursor.execute("SELECT count(*) FROM sessions").fetchone()[0]:
-            connection.close()
             raise ValueError("Filter-version migration requires a full refresh without limit")
         incremental = False
     scope_index_to_input(cursor, input_path, source_paths, remove_missing=limit is None,
@@ -434,6 +559,9 @@ def index_sessions(
                 continue
         parsed = parse_session_file(path)
         if parsed is None:
+            original_path = source_path[:-4] if source_path.endswith(".jsonl.zst") else source_path + ".zst"
+            if original_path in prior_paths and original_path not in source_paths:
+                raise ValueError(f"Cannot recover indexed session from replacement: {path}")
             if existing:
                 displaced_session_ids.add(existing[0])
                 cursor.execute("DELETE FROM sessions WHERE source_path=?", (source_path,))
@@ -494,5 +622,4 @@ def index_sessions(
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                    (dt.datetime.now(dt.timezone.utc).isoformat(),))
     connection.commit()
-    connection.close()
     return indexed, skipped, retained_messages

@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Local-first indexing, search, and review tools for AI conversation archives."
 readme = "README.md"
 requires-python = ">=3.9"
+dependencies = ["zstandard>=0.22,<1"]
 license = { file = "LICENSE" }
 authors = [{ name = "Ethan Millstein" }]
 classifiers = [

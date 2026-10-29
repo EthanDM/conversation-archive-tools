@@ -92,7 +92,7 @@ Codex sessions are indexed separately from ChatGPT history:
 # Initial build; reads ~/.codex/sessions by default.
 conversation-archive-index-codex --reset
 
-# Later runs reindex only changed JSONL files.
+# Later runs reindex only changed JSONL or compressed JSONL files.
 conversation-archive-index-codex
 
 conversation-archive-search-codex '"browser-only"' --context 2
@@ -100,11 +100,13 @@ conversation-archive-show-codex --title "personal site" --list
 conversation-archive-show-codex --session <session-id> --max-chars 2000
 ```
 
+Codex indexing and publishing support both `.jsonl` and Zstandard-compressed `.jsonl.zst` sessions. Compression requires the `zstandard` package installed with this project. A refresh fails without committing changes if a compressed session is corrupt or incomplete. A reset builds a replacement first and requires the old index to be free of SQLite sidecars; close other connections and allow SQLite to checkpoint before retrying. Do not run filesystem restores, copies, or synchronization that write the index or its sidecars while reset is running: those operations bypass SQLite locks and can leave the rebuilt index inconsistent. The default input remains `~/.codex/sessions`; configure other roots explicitly if needed.
+
 The Codex index retains filtered user and assistant text for search. It excludes developer/system wrappers, injected skill instructions, function calls/results, reasoning, terminal/event logs, and images. Override defaults with `CODEX_SESSION_INPUT` and `CODEX_SESSION_DB`.
 
 ### Share Codex history between Macs
 
-Keep Codex and every SQLite database local. To search history from multiple Macs, explicitly publish each Mac's JSONL session files into a private shared archive, then build a local index from that archive. This command never uploads data itself; the archive location is a local filesystem path managed by you.
+Keep Codex and every SQLite database local. To search history from multiple Macs, explicitly publish each Mac's JSONL or compressed JSONL session files into a private shared archive, then build a local index from that archive. This command never uploads data itself; the archive location is a local filesystem path managed by you.
 
 ```bash
 # On main-mbp: one-time claim for its populated legacy namespace
