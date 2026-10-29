@@ -5,10 +5,13 @@ import json
 import errno
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
+
+import zstandard
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -124,6 +127,306 @@ class CodexSessionIndexTests(unittest.TestCase):
             with sqlite3.connect(db) as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 1)
                 self.assertEqual(connection.execute("SELECT text FROM messages").fetchone()[0], "A replacement request.")
+
+    def test_compressed_transition_preserves_searchable_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            index_sessions(source.parent, db)
+            compressed = source.with_name(source.name + ".zst")
+            compressed.write_bytes(zstandard.ZstdCompressor().compress(source.read_bytes()))
+            source.unlink()
+            index_sessions(compressed.parent, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT source_path FROM sessions").fetchone()[0], str(compressed.resolve()))
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 3)
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'text:browser'").fetchone()[0], 1)
+            self.assertEqual(index_sessions(compressed.parent, db), (0, 1, 0))
+
+    def test_corrupt_compressed_replacement_does_not_remove_indexed_history(self) -> None:
+        for invalid in (b"not a zstd frame", zstandard.ZstdCompressor().compress(b"valid text")[:-1],
+                        zstandard.ZstdCompressor().compress(b"no session metadata\n")):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = self.write_fixture(root / "sessions")
+                db = root / "index.sqlite"
+                index_sessions(source.parent, db)
+                source.with_name(source.name + ".zst").write_bytes(invalid)
+                source.unlink()
+                with self.assertRaises(ValueError):
+                    index_sessions(root / "sessions", db)
+                with sqlite3.connect(db) as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 3)
+
+    def test_reset_failure_preserves_existing_index_and_success_rebuilds_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            index_sessions(source.parent, db)
+            broken = source.parent / "broken.jsonl.zst"
+            broken.write_bytes(b"invalid zstandard data")
+            with self.assertRaises(ValueError):
+                index_sessions(source.parent, db, reset=True)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 3)
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'text:browser'").fetchone()[0], 1)
+            broken.unlink()
+            source.write_text(event("session_meta", {"id": "new-session"}) + message("user", "rebuilt text"))
+            index_sessions(source.parent, db, reset=True)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT session_id FROM sessions").fetchone()[0], "new-session")
+                self.assertEqual(connection.execute("SELECT text FROM messages").fetchone()[0], "rebuilt text")
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'text:browser'").fetchone()[0], 0)
+
+    def test_reset_recovers_corrupt_or_incompatible_database_only_after_success(self) -> None:
+        for invalid_database in ("corrupt", "incompatible"):
+            with self.subTest(invalid_database=invalid_database), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = self.write_fixture(root / "sessions")
+                db = root / "index.sqlite"
+                if invalid_database == "corrupt":
+                    db.write_bytes(b"not a sqlite database")
+                else:
+                    with sqlite3.connect(db) as connection:
+                        connection.execute("CREATE TABLE sessions (wrong_column TEXT)")
+                before = db.read_bytes()
+                broken = source.parent / "broken.jsonl.zst"
+                broken.write_bytes(b"invalid zstandard data")
+                with self.assertRaises(ValueError):
+                    index_sessions(source.parent, db, reset=True)
+                self.assertEqual(db.read_bytes(), before)
+                self.assertEqual(list(root.glob(".index.sqlite.*.tmp")), [])
+                broken.unlink()
+                self.assertEqual(index_sessions(source.parent, db, reset=True), (1, 0, 3))
+                with sqlite3.connect(db) as connection:
+                    self.assertEqual(connection.execute("SELECT session_id FROM sessions").fetchone()[0], "session-1")
+                    self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 3)
+
+    def test_reset_does_not_modify_incompatible_index_when_input_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db = root / "index.sqlite"
+            with sqlite3.connect(db) as connection:
+                connection.executescript("""
+                    CREATE TABLE sessions(session_id TEXT PRIMARY KEY, source_path TEXT, file_size INTEGER,
+                                          file_mtime_ns INTEGER, last_time_iso TEXT);
+                    CREATE TABLE messages(session_id TEXT, seq INTEGER, role TEXT, create_time_iso TEXT, text TEXT);
+                    CREATE TABLE index_meta(key TEXT, value TEXT);
+                """)
+            before = db.read_bytes()
+            source = root / "broken.jsonl.zst"
+            source.write_bytes(b"not zstandard")
+            with self.assertRaises(ValueError):
+                index_sessions(source, db, reset=True)
+            self.assertEqual(db.read_bytes(), before)
+
+    def test_reset_holds_sqlite_writer_lock_through_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            with sqlite3.connect(db) as connection:
+                connection.execute("CREATE TABLE old_data(value TEXT)")
+            replace = os.replace
+            writer_blocked = []
+
+            def check_writer_then_replace(source_path: object, destination_path: object) -> None:
+                try:
+                    with sqlite3.connect(db, timeout=0) as writer:
+                        writer.execute("INSERT INTO old_data VALUES ('must not commit')")
+                except sqlite3.OperationalError as error:
+                    writer_blocked.append(str(error))
+                writer_code = (
+                    "import sqlite3, sys; "
+                    "c = sqlite3.connect(sys.argv[1], timeout=0); "
+                    "c.execute(\"INSERT INTO old_data VALUES ('other process')\"); c.commit()"
+                )
+                other = subprocess.run([sys.executable, "-c", writer_code, str(db)], capture_output=True, text=True)
+                self.assertNotEqual(other.returncode, 0)
+                self.assertIn("locked", other.stderr)
+                replace(source_path, destination_path)
+
+            with patch.object(session_index.os, "replace", side_effect=check_writer_then_replace):
+                index_sessions(source.parent, db, reset=True)
+            self.assertEqual(len(writer_blocked), 1)
+            self.assertIn("locked", writer_blocked[0])
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
+
+    def test_reset_does_not_replace_database_changed_during_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            db.write_bytes(b"not a sqlite database")
+            refresh = session_index._refresh_index
+
+            def refresh_and_change_database(*args: object, **kwargs: object):
+                result = refresh(*args, **kwargs)
+                db.write_bytes(b"changed while rebuilding")
+                return result
+
+            with patch.object(session_index, "_refresh_index", side_effect=refresh_and_change_database):
+                with self.assertRaisesRegex(ValueError, "changed during recovery"):
+                    index_sessions(source.parent, db, reset=True)
+            self.assertEqual(db.read_bytes(), b"changed while rebuilding")
+
+    def test_reset_refuses_to_replace_unreadable_database_with_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            db.write_bytes(b"not a sqlite database")
+            sidecar = root / "index.sqlite-wal"
+            sidecar.write_bytes(b"uncheckpointed data")
+            with self.assertRaisesRegex(ValueError, "SQLite sidecars"):
+                index_sessions(source.parent, db, reset=True)
+            self.assertEqual(db.read_bytes(), b"not a sqlite database")
+            self.assertEqual(sidecar.read_bytes(), b"uncheckpointed data")
+
+    def test_reset_refuses_missing_database_with_live_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            connection = sqlite3.connect(db)
+            try:
+                self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+                connection.execute("CREATE TABLE old_data(value TEXT)")
+                connection.execute("INSERT INTO old_data VALUES ('old history')")
+                connection.commit()
+                wal = root / "index.sqlite-wal"
+                self.assertTrue(wal.exists())
+                original_wal = wal.read_bytes()
+                db.unlink()
+                with self.assertRaisesRegex(ValueError, "SQLite sidecars"):
+                    index_sessions(source.parent, db, reset=True)
+                self.assertFalse(db.exists())
+                self.assertEqual(wal.read_bytes(), original_wal)
+                self.assertEqual(connection.execute("SELECT value FROM old_data").fetchone()[0], "old history")
+            finally:
+                connection.close()
+
+    def test_reset_rejects_sidecars_arriving_during_missing_database_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            wal = root / "index.sqlite-wal"
+            link = os.link
+
+            def link_after_sidecar_arrives(source_path: object, destination_path: object) -> None:
+                wal.write_bytes(b"restored sidecar")
+                link(source_path, destination_path)
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    with sqlite3.connect(db, timeout=0) as reader:
+                        reader.execute("SELECT count(*) FROM sessions").fetchone()
+
+            with patch.object(session_index.os, "link", side_effect=link_after_sidecar_arrives):
+                with self.assertRaisesRegex(ValueError, "SQLite sidecars"):
+                    index_sessions(source.parent, db, reset=True)
+            self.assertFalse(db.exists())
+            self.assertEqual(wal.read_bytes(), b"restored sidecar")
+            self.assertEqual(list(root.glob(".index.sqlite.*.tmp")), [])
+
+    def test_missing_index_remains_locked_after_final_sidecar_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            db = root / "index.sqlite"
+            check = session_index._check_index_sidecars
+            attempts = []
+
+            def check_then_try_writer(path: Path) -> None:
+                check(path)
+                attempts.append(1)
+                if len(attempts) == 2:
+                    writer_code = (
+                        "import sqlite3, sys; "
+                        "c = sqlite3.connect(sys.argv[1], timeout=0); "
+                        "c.execute(\"DELETE FROM sessions\"); c.commit()"
+                    )
+                    writer = subprocess.run([sys.executable, "-c", writer_code, str(db)], capture_output=True, text=True)
+                    self.assertNotEqual(writer.returncode, 0)
+                    self.assertIn("locked", writer.stderr)
+
+            with patch.object(session_index, "_check_index_sidecars", side_effect=check_then_try_writer):
+                index_sessions(source.parent, db, reset=True)
+            self.assertEqual(len(attempts), 2)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
+
+    def test_invalid_same_path_compressed_session_preserves_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            compressed = source.with_name(source.name + ".zst")
+            compressed.write_bytes(zstandard.ZstdCompressor().compress(source.read_bytes()))
+            source.unlink()
+            db = root / "index.sqlite"
+            index_sessions(compressed.parent, db)
+            compressed.write_bytes(zstandard.ZstdCompressor().compress(b"no session metadata\n"))
+            with self.assertRaisesRegex(ValueError, "no session ID"):
+                index_sessions(compressed.parent, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 3)
+                self.assertEqual(connection.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'text:browser'").fetchone()[0], 1)
+
+    def test_compressed_guardian_session_remains_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "guardian.jsonl.zst"
+            content = event("session_meta", {"thread_source": "guardian_review"})
+            source.write_bytes(zstandard.ZstdCompressor().compress(content.encode()))
+            self.assertIsNone(parse_session_file(source))
+            self.assertEqual(index_sessions(root, root / "index.sqlite"), (0, 0, 0))
+
+    def test_publisher_copies_compressed_files_and_shared_index_reads_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions" / "2026")
+            compressed = source.with_name(source.name + ".zst")
+            compressed.write_bytes(zstandard.ZstdCompressor().compress(source.read_bytes()))
+            source.unlink()
+            archive = root / "archive"
+            result = publish_sessions(root / "sessions", archive, "desktop")
+            self.assertEqual(result.copied, 1)
+            self.assertEqual((result.destination / "2026" / compressed.name).read_bytes(), compressed.read_bytes())
+            self.assertEqual(publish_sessions(root / "sessions", archive, "desktop").skipped, 1)
+            db = root / "index.sqlite"
+            self.assertEqual(index_sessions(archive, db), (1, 0, 3))
+            self.assertEqual(publish_sessions(compressed, archive, "desktop").copied, 1)
+
+    def test_plain_and_compressed_duplicates_use_newer_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root / "sessions")
+            compressed = source.with_name(source.name + ".zst")
+            compressed.write_bytes(zstandard.ZstdCompressor().compress(source.read_bytes() + message("user", "newer compressed text").encode()))
+            os.utime(source, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(compressed, ns=(2_000_000_000, 2_000_000_000))
+            db = root / "index.sqlite"
+            index_sessions(source.parent, db)
+            index_sessions(source.parent, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 1)
+                self.assertIn("newer compressed text", [r[0] for r in connection.execute("SELECT text FROM messages")])
+
+    def test_concatenated_compressed_frames_and_utf8_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.write_fixture(root)
+            text = source.read_bytes() + message("user", "café").replace("\\u00e9", "é").encode()
+            split = text.index("é".encode()) + 1
+            compressor = zstandard.ZstdCompressor()
+            compressed = source.with_name(source.name + ".zst")
+            compressed.write_bytes(compressor.compress(text[:split]) + compressor.compress(text[split:]))
+            self.assertEqual(parse_session_file(compressed).messages[-1].text, "café")
 
     def test_publisher_uses_machine_namespaces_and_shared_indexing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

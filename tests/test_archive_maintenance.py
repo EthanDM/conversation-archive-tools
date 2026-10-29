@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import zstandard
+
 from conversation_archive import maintenance, retrieval
 
 
@@ -119,6 +121,9 @@ class MaintenanceTests(unittest.TestCase):
         shared=self.root/'shared-stdio'
         remote=write_source(shared,'codex','remoteprotocolneedle')
         remote.write_text(remote.read_text().replace('synthetic','remote-protocol-session'))
+        compressed = remote.with_name(remote.name + '.zst')
+        compressed.write_bytes(zstandard.ZstdCompressor().compress(remote.read_bytes()))
+        remote.unlink()
         async def exercise():
             env=dict(os.environ,**self.env)
             env['CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT']=str(shared)

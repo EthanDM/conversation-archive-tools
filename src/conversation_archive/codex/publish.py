@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .session_files import is_session_file, session_lines
 from .paths import (
     INSTALLATION_ID_PATH,
     default_input_path,
@@ -34,13 +35,13 @@ class PublishResult:
 
 def iter_session_files(input_path: Path) -> list[tuple[Path, Path]]:
     if input_path.is_file():
-        if input_path.suffix != ".jsonl":
+        if not is_session_file(input_path):
             raise ValueError(f"Codex session input is not a JSONL file: {input_path}")
         return [(input_path, Path(input_path.name))]
     return [
         (path, path.relative_to(input_path))
-        for path in sorted(input_path.rglob("*.jsonl"))
-        if path.is_file() and not path.is_symlink()
+        for path in sorted(input_path.rglob("*.jsonl*"))
+        if is_session_file(path) and path.is_file() and not path.is_symlink()
     ]
 
 
@@ -62,17 +63,16 @@ def contents_match(source: Path, destination: Path) -> bool:
 
 def session_id(path: Path) -> str | None:
     """Return the Codex session ID recorded in a JSONL file, if present."""
-    with path.open(encoding="utf-8") as source:
-        for line in source:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = event.get("payload")
-            if event.get("type") == "session_meta" and isinstance(payload, dict):
-                value = payload.get("id")
-                if isinstance(value, str):
-                    return value
+    for line in session_lines(path):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = event.get("payload")
+        if event.get("type") == "session_meta" and isinstance(payload, dict):
+            value = payload.get("id")
+            if isinstance(value, str):
+                return value
     return None
 
 
@@ -358,7 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Publish one Mac's Codex session JSONL files to its private archive namespace."
     )
-    parser.add_argument("--input", default=default_input_path(), help="Local Codex sessions directory or one JSONL session")
+    parser.add_argument("--input", default=default_input_path(), help="Local Codex sessions directory or one .jsonl or .jsonl.zst session")
     parser.add_argument(
         "--archive-root",
         help="Shared Codex-session archive root; defaults to the configured ChatGPT Archive/codex-sessions",
