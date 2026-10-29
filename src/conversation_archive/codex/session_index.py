@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from .session_files import is_session_file, session_lines
+from .source_roots import ensure_scope_not_narrowed
 
 
 INDEXER_VERSION = "2"
@@ -327,6 +328,7 @@ def scope_index_to_input(
     *,
     remove_missing: bool,
     additional_inputs: tuple[Path, ...] = (),
+    protected_missing_roots: tuple[Path, ...] = (),
 ) -> None:
     """Remove rows outside all explicit inputs or whose source file is no longer present."""
     roots = (input_path, *additional_inputs)
@@ -334,7 +336,9 @@ def scope_index_to_input(
         (source_path,)
         for (source_path,) in cursor.execute("SELECT source_path FROM sessions")
         if (
-            (remove_missing and source_path not in source_paths)
+            (remove_missing and source_path not in source_paths
+             and not any(root == Path(source_path) or root in Path(source_path).parents
+                         for root in protected_missing_roots))
             or not any(
                 Path(source_path) == root or (root.is_dir() and root in Path(source_path).parents)
                 for root in roots
@@ -381,6 +385,21 @@ def replace_session(
     return len(parsed.messages)
 
 
+def extends_indexed_session(cursor: sqlite3.Cursor, parsed: ParsedSession) -> bool:
+    """Accept an equal-timestamp snapshot only if it preserves all indexed messages."""
+    metadata = cursor.execute(
+        "SELECT cwd FROM sessions WHERE session_id=?", (parsed.session_id,)
+    ).fetchone()
+    if metadata is None or metadata[0] != parsed.cwd:
+        return False
+    messages = cursor.execute(
+        "SELECT role, create_time_iso, text FROM messages WHERE session_id=? ORDER BY seq",
+        (parsed.session_id,),
+    ).fetchall()
+    candidate = [(message.role, message.create_time_iso, message.text) for message in parsed.messages]
+    return len(candidate) >= len(messages) and candidate[:len(messages)] == messages
+
+
 def parse_session_snapshot(path: Path) -> Optional[tuple[object, ParsedSession]]:
     """Parse a stable session-file snapshot, retrying one concurrent replacement."""
     for _ in range(2):
@@ -400,6 +419,8 @@ def index_sessions(
     incremental: bool = True,
     limit: Optional[int] = None,
     additional_inputs: tuple[Path, ...] = (),
+    preserve_scope: bool = False,
+    protected_missing_roots: tuple[Path, ...] = (),
 ) -> tuple[int, int, int]:
     """Refresh a local session index and return indexed, skipped, and retained counts.
 
@@ -409,9 +430,15 @@ def index_sessions(
     Callers must prevent raw file restores or copies at the index path throughout
     reset; SQLite locks cannot coordinate with operations that bypass SQLite.
     Explicit additional inputs form one source union; all roots must exist before writes.
+    With preserve_scope, reject narrowing within the same transaction as pruning.
+    protected_missing_roots retain missing rows until their sessions are rediscovered
+    or the index is explicitly reset.
     """
     input_path = input_path.expanduser().resolve()
     additional_inputs = tuple(path.expanduser().resolve() for path in additional_inputs)
+    protected_missing_roots = tuple(path.expanduser().resolve() for path in protected_missing_roots)
+    if any(root not in (input_path, *additional_inputs) for root in protected_missing_roots):
+        raise ValueError("Protected missing roots must be selected inputs")
     for root in additional_inputs:
         if not root.exists():
             raise FileNotFoundError("Additional Codex session input does not exist")
@@ -431,7 +458,12 @@ def index_sessions(
         return _reset_index(db_path, input_path, additional_inputs, source_paths, paths, limit)
     connection = connect(db_path)
     try:
-        return _refresh_index(connection, input_path, additional_inputs, source_paths, paths, limit, incremental, False)
+        if preserve_scope:
+            # Source metadata must remain stable from the scope check through pruning.
+            connection.execute("BEGIN IMMEDIATE")
+            ensure_scope_not_narrowed(connection, (input_path, *additional_inputs))
+        return _refresh_index(connection, input_path, additional_inputs, source_paths, paths, limit, incremental, False,
+                              protected_missing_roots=protected_missing_roots)
     finally:
         connection.close()
 
@@ -527,6 +559,7 @@ def _replace_index_under_lock(db_path: Path, temporary: Path, original: os.stat_
 def _refresh_index(
     connection: sqlite3.Connection, input_path: Path, additional_inputs: tuple[Path, ...],
     source_paths: set[str], paths: list[Path], limit: Optional[int], incremental: bool, reset: bool,
+    *, protected_missing_roots: tuple[Path, ...] = (),
 ) -> tuple[int, int, int]:
     """Update one index transaction and return indexed, skipped, and message counts."""
     # All removals and replacements share one transaction: an unreadable compressed
@@ -543,7 +576,7 @@ def _refresh_index(
             raise ValueError("Filter-version migration requires a full refresh without limit")
         incremental = False
     scope_index_to_input(cursor, input_path, source_paths, remove_missing=limit is None,
-                         additional_inputs=additional_inputs)
+                         additional_inputs=additional_inputs, protected_missing_roots=protected_missing_roots)
     indexed = skipped = retained_messages = 0
     displaced_session_ids: set[str] = set()
 
@@ -579,6 +612,14 @@ def _refresh_index(
             existing_session
             and existing_session[0] != source_path
             and existing_session[1] >= stat.st_mtime_ns
+            and not (
+                existing_session[1] == stat.st_mtime_ns
+                and any(root == Path(existing_session[0]) or root in Path(existing_session[0]).parents
+                        for root in protected_missing_roots)
+                and any(root == path or root in path.parents for root in protected_missing_roots)
+                and not Path(existing_session[0]).exists()
+                and extends_indexed_session(cursor, parsed)
+            )
         ):
             skipped += 1
             continue

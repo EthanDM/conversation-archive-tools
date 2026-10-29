@@ -1209,7 +1209,7 @@ class CodexSessionIndexTests(unittest.TestCase):
                 self.assertEqual(codex_index.main(["--shared", "--db", str(db)]), 0)
             self.assertTrue(db.exists())
 
-    def test_shared_index_removes_rows_from_a_prior_local_index(self) -> None:
+    def test_shared_index_refuses_to_narrow_a_prior_local_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             local = self.write_fixture(root / "local")
@@ -1222,7 +1222,14 @@ class CodexSessionIndexTests(unittest.TestCase):
                 {"CONVERSATION_ARCHIVE_SHARED_CODEX_ROOT": str(root / "shared")},
                 clear=False,
             ):
-                codex_index.main(["--shared", "--db", str(db)])
+                with self.assertRaisesRegex(ValueError, "other source roots"):
+                    codex_index.main(["--shared", "--db", str(db)])
+                with sqlite3.connect(db) as connection:
+                    self.assertEqual(
+                        {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
+                        {"session-1"},
+                    )
+                codex_index.main(["--shared", "--reset", "--db", str(db)])
             with sqlite3.connect(db) as connection:
                 self.assertEqual(
                     {row[0] for row in connection.execute("SELECT session_id FROM sessions")},
