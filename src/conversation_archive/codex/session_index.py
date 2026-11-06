@@ -400,6 +400,22 @@ def extends_indexed_session(cursor: sqlite3.Cursor, parsed: ParsedSession) -> bo
     return len(candidate) >= len(messages) and candidate[:len(messages)] == messages
 
 
+def compare_session_history(existing: list[tuple], parsed: ParsedSession) -> int:
+    """Compare retained histories; reject divergent copies rather than choosing by timestamp."""
+    candidate = [(message.role, message.create_time_iso, message.text) for message in parsed.messages]
+    common = min(len(existing), len(candidate))
+    if existing[:common] != candidate[:common]:
+        raise ValueError(f"Conflicting archived Codex session copies: {parsed.session_id}")
+    return (len(candidate) > len(existing)) - (len(candidate) < len(existing))
+
+
+def compare_archived_duplicate(cursor: sqlite3.Cursor, parsed: ParsedSession) -> int:
+    existing = cursor.execute(
+        "SELECT role, create_time_iso, text FROM messages WHERE session_id=? ORDER BY seq", (parsed.session_id,)
+    ).fetchall()
+    return compare_session_history(existing, parsed)
+
+
 def parse_session_snapshot(path: Path) -> Optional[tuple[object, ParsedSession]]:
     """Parse a stable session-file snapshot, retrying one concurrent replacement."""
     for _ in range(2):
@@ -579,6 +595,14 @@ def _refresh_index(
                          additional_inputs=additional_inputs, protected_missing_roots=protected_missing_roots)
     indexed = skipped = retained_messages = 0
     displaced_session_ids: set[str] = set()
+    # A session with an archived copy must use history comparison for every copy,
+    # even if the archived file sorts before or after the other candidates.
+    archived_session_ids = set()
+    for path in paths:
+        if "_archived_sessions" in path.parts:
+            parsed = parse_session_file(path)
+            if parsed is not None:
+                archived_session_ids.add(parsed.session_id)
 
     for path in paths:
         stat = path.stat()
@@ -608,9 +632,19 @@ def _refresh_index(
             "SELECT source_path, file_mtime_ns FROM sessions WHERE session_id=?",
             (parsed.session_id,),
         ).fetchone()
+        archived_comparison = None
+        if existing_session and existing_session[0] != source_path and (
+            parsed.session_id in archived_session_ids or "_archived_sessions" in Path(existing_session[0]).parts
+        ):
+            # Publishing creates fresh mtimes, so retained history determines which copy wins.
+            archived_comparison = compare_archived_duplicate(cursor, parsed)
+            if archived_comparison < 0:
+                skipped += 1
+                continue
         if (
             existing_session
             and existing_session[0] != source_path
+            and archived_comparison != 1
             and existing_session[1] >= stat.st_mtime_ns
             and not (
                 existing_session[1] == stat.st_mtime_ns
@@ -636,7 +670,12 @@ def _refresh_index(
             if parsed is None or parsed.session_id not in displaced_session_ids:
                 continue
             candidate = displaced_candidates.get(parsed.session_id)
-            if candidate is None or stat.st_mtime_ns > candidate[1].st_mtime_ns:
+            comparison = 0
+            if candidate and parsed.session_id in archived_session_ids:
+                previous = candidate[2]
+                previous_messages = [(m.role, m.create_time_iso, m.text) for m in previous.messages]
+                comparison = compare_session_history(previous_messages, parsed)
+            if candidate is None or comparison > 0 or (comparison == 0 and stat.st_mtime_ns > candidate[1].st_mtime_ns):
                 displaced_candidates[parsed.session_id] = (path, stat, parsed)
 
         for path, stat, parsed in displaced_candidates.values():
@@ -645,6 +684,11 @@ def _refresh_index(
                 (str(path.resolve()),),
             ).fetchone()
             if existing == (parsed.session_id, stat.st_size, stat.st_mtime_ns):
+                continue
+            prior = cursor.execute("SELECT source_path FROM sessions WHERE session_id=?", (parsed.session_id,)).fetchone()
+            if prior and prior[0] != str(path.resolve()) and (
+                parsed.session_id in archived_session_ids or "_archived_sessions" in Path(prior[0]).parts
+            ) and compare_archived_duplicate(cursor, parsed) < 0:
                 continue
             retained_messages += replace_session(cursor, parsed, str(path.resolve()), stat)
             indexed += 1

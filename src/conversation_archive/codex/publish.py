@@ -7,6 +7,7 @@ import errno
 import filecmp
 import fcntl
 import json
+from itertools import zip_longest
 import os
 import shutil
 import sys
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .session_files import is_session_file, session_lines
+from .source_roots import local_archived_root
 from .paths import (
     INSTALLATION_ID_PATH,
     default_input_path,
@@ -61,9 +63,18 @@ def contents_match(source: Path, destination: Path) -> bool:
     return filecmp.cmp(source, destination, shallow=False)
 
 
-def session_id(path: Path) -> str | None:
+def archived_snapshot_extends(source: Path, destination: Path, *, compressed: bool | None = None) -> bool:
+    """Allow replacement only when the complete existing event stream is preserved."""
+    sentinel = object()
+    for old, new in zip_longest(session_lines(destination), session_lines(source, compressed=compressed), fillvalue=sentinel):
+        if old is not sentinel and old != new:
+            return False
+    return True
+
+
+def session_id(path: Path, *, compressed: bool | None = None) -> str | None:
     """Return the Codex session ID recorded in a JSONL file, if present."""
-    for line in session_lines(path):
+    for line in session_lines(path, compressed=compressed):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -289,6 +300,7 @@ def publish_sessions(
     installation: str | None = None,
     wait_for_claim_sync: bool = False,
     confirm_claim_sync: bool = False,
+    archived_input: Path | None = None,
 ) -> PublishResult:
     machine_id = validate_machine_id(machine_id)
     source_root = input_path.expanduser().resolve()
@@ -302,6 +314,21 @@ def publish_sessions(
     if not source_root.exists():
         raise FileNotFoundError(f"Codex session input does not exist: {source_root}")
     session_files = iter_session_files(source_root)
+    if archived_input is not None:
+        archived_root = archived_input.expanduser().resolve()
+        if archived_root == source_root:
+            raise ValueError("Codex active and archived inputs must be different directories.")
+        if not archived_root.is_dir():
+            raise FileNotFoundError(f"Codex archived session input does not exist: {archived_root}")
+        if archived_root == destination_root or archived_root.is_relative_to(destination_root):
+            raise ValueError("Codex archived session input must not be inside its archive destination.")
+        if destination_root.is_relative_to(archived_root):
+            raise ValueError("Codex session archive destination must not be inside its archived input directory.")
+        # Preserve existing active paths and reserve a separate namespace for archived files.
+        prefix = Path("_archived_sessions")
+        if any(relative.parts[0] == str(prefix) for _, relative in session_files):
+            raise ValueError("Codex active sessions conflict with the archived-session namespace.")
+        session_files.extend((source, prefix / relative) for source, relative in iter_session_files(archived_root))
 
     mkdir_durable(archive_root, parents=True)
     claimed, reservation_existed_at_start = reserve_machine_id(
@@ -320,12 +347,7 @@ def publish_sessions(
         if destination.is_symlink():
             raise ValueError(f"Codex session archive destination is a symlink: {destination}")
         source_mode = source.stat().st_mode & 0o777
-        if input_path.is_file() and destination.exists() and not contents_match(source, destination):
-            if session_id(source) != session_id(destination):
-                raise ValueError(
-                    "Codex session archive destination already contains a different single-file session: "
-                    f"{destination}"
-                )
+        is_archived = archived_input is not None and relative_path.parts[0] == "_archived_sessions"
         if (
             destination.exists()
             and not os.path.samestat(source.stat(), destination.stat())
@@ -346,6 +368,15 @@ def publish_sessions(
             os.close(descriptor)
             shutil.copyfile(source, temporary)
             temporary.chmod(source_mode)
+            # Validate the copied snapshot, which may differ from the source we first inspected.
+            if (input_path.is_file() or is_archived) and destination.exists() and not contents_match(temporary, destination):
+                compressed = destination.name.endswith(".jsonl.zst")
+                copied_id = session_id(temporary, compressed=compressed)
+                if (is_archived and copied_id is None) or copied_id != session_id(destination):
+                    kind = "session" if is_archived else "single-file session"
+                    raise ValueError(f"Codex session archive destination already contains a different {kind}: {destination}")
+                if is_archived and not archived_snapshot_extends(temporary, destination, compressed=compressed):
+                    raise ValueError(f"Codex archived session would replace existing history: {destination}")
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)
@@ -358,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Publish one Mac's Codex session JSONL files to its private archive namespace."
     )
-    parser.add_argument("--input", default=default_input_path(), help="Local Codex sessions directory or one .jsonl or .jsonl.zst session")
+    parser.add_argument("--input", help="Local Codex sessions directory or one .jsonl or .jsonl.zst session; defaults to active and archived local sessions")
     parser.add_argument(
         "--archive-root",
         help="Shared Codex-session archive root; defaults to the configured ChatGPT Archive/codex-sessions",
@@ -395,6 +426,12 @@ def main(argv: list[str]) -> int:
         else Path(default_shared_input_path()).expanduser()
     )
     machine_id = validate_machine_id(args.machine_id)
+    input_path = Path(args.input or default_input_path()).expanduser()
+    archived_input = None
+    if args.input is None:
+        archived_input = local_archived_root(input_path)
+        if archived_input is not None and not archived_input.exists() and not os.environ.get("CODEX_SESSION_ARCHIVED_INPUT"):
+            archived_input = None
     installation_path = INSTALLATION_ID_PATH.expanduser()
     with installation_id_lock(installation_path, exclusive=args.rotate_installation_id):
         previous_installation = None
@@ -406,13 +443,14 @@ def main(argv: list[str]) -> int:
                 rotation_started = True
                 rotated_installation = rotate_installation_id(installation_path)
             result = publish_sessions(
-                Path(args.input).expanduser(),
+                input_path,
                 archive_root,
                 machine_id,
                 claim_existing_machine_id=args.claim_existing_machine_id,
                 wait_for_claim_sync=True,
                 confirm_claim_sync=args.confirm_machine_id_sync,
                 installation=rotated_installation,
+                archived_input=archived_input,
             )
         except BaseException:
             if rotation_started and should_restore_rotated_installation(
