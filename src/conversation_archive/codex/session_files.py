@@ -13,13 +13,16 @@ def is_session_file(path: Path) -> bool:
     return path.name.endswith((".jsonl", ".jsonl.zst"))
 
 
-def session_lines(path: Path) -> Iterator[str]:
+def session_lines(path: Path, *, compressed: bool | None = None) -> Iterator[str]:
     """Yield UTF-8 lines; reject corrupt or incomplete compressed frames.
 
     Validation completes only when the iterator is exhausted. The file is never
-    expanded on disk, and concatenated Zstandard frames are supported.
+    expanded on disk, and concatenated Zstandard frames are supported. Set
+    ``compressed`` when a temporary file does not retain its original suffix.
     """
-    if not path.name.endswith(".jsonl.zst"):
+    if compressed is None:
+        compressed = path.name.endswith(".jsonl.zst")
+    if not compressed:
         with path.open(encoding="utf-8", errors="replace") as source:
             yield from source
         return

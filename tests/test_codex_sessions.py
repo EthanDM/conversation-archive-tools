@@ -402,6 +402,260 @@ class CodexSessionIndexTests(unittest.TestCase):
             self.assertEqual(index_sessions(archive, db), (1, 0, 3))
             self.assertEqual(publish_sessions(compressed, archive, "desktop").copied, 1)
 
+    def test_default_publisher_includes_archived_sessions_and_repeats_safely(self) -> None:
+        from conversation_archive.codex import source_roots
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / ".codex" / "sessions"
+            archived = root / ".codex" / "archived_sessions"
+            active_file = self.write_fixture(active, "same.jsonl.zst")
+            active_file.write_bytes(zstandard.ZstdCompressor().compress(active_file.read_bytes()))
+            archived_file = self.write_fixture(archived, "same.jsonl.zst")
+            archived_file.write_bytes(zstandard.ZstdCompressor().compress(
+                archived_file.read_bytes().replace(b'"session-1"', b'"session-2"')
+            ))
+            shared = root / "shared"
+            args = ["--machine-id", "desktop", "--archive-root", str(shared)]
+            with patch.object(source_roots, "DEFAULT_INPUT_PATH", active), \
+                 patch.object(codex_publish, "default_input_path", return_value=str(active)), \
+                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(codex_publish.main(args), 0)
+                self.assertEqual(codex_publish.main(args + ["--confirm-machine-id-sync"]), 0)
+                self.assertEqual(codex_publish.main(args + ["--confirm-machine-id-sync"]), 0)
+            self.assertIn("copied 0 sessions, skipped 2", output.getvalue())
+            self.assertEqual((shared / "desktop" / active_file.name).read_bytes(), active_file.read_bytes())
+            self.assertEqual((shared / "desktop" / "_archived_sessions" / archived_file.name).read_bytes(), archived_file.read_bytes())
+            db = root / "shared.sqlite"
+            index_sessions(shared, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual({row[0] for row in connection.execute("SELECT session_id FROM sessions")}, {"session-1", "session-2"})
+
+    def test_default_publisher_uses_configured_archived_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active, archived = root / "active", root / "custom-archive"
+            self.write_fixture(active)
+            self.write_fixture(archived, "archived.jsonl")
+            args = ["--machine-id", "desktop", "--archive-root", str(root / "shared")]
+            with patch.object(codex_publish, "default_input_path", return_value=str(active)), \
+                 patch.dict(os.environ, {"CODEX_SESSION_ARCHIVED_INPUT": str(archived)}), redirect_stdout(io.StringIO()):
+                codex_publish.main(args)
+                codex_publish.main(args + ["--confirm-machine-id-sync"])
+            self.assertTrue((root / "shared" / "desktop" / "_archived_sessions" / "archived.jsonl").exists())
+
+    def test_default_publisher_allows_missing_default_archive(self) -> None:
+        from conversation_archive.codex import source_roots
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / ".codex" / "sessions"
+            self.write_fixture(active)
+            args = ["--machine-id", "desktop", "--archive-root", str(root / "shared")]
+            with patch.object(source_roots, "DEFAULT_INPUT_PATH", active), \
+                 patch.object(codex_publish, "default_input_path", return_value=str(active)), \
+                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                codex_publish.main(args)
+                codex_publish.main(args + ["--confirm-machine-id-sync"])
+            self.assertTrue((root / "shared" / "desktop" / "session.jsonl").exists())
+
+    def test_explicit_publisher_input_excludes_archived_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            archived = root / "archived"
+            self.write_fixture(active)
+            self.write_fixture(archived)
+            args = ["--machine-id", "desktop", "--archive-root", str(root / "shared"), "--input", str(active)]
+            with patch.dict(os.environ, {"CODEX_SESSION_ARCHIVED_INPUT": str(archived)}), redirect_stdout(io.StringIO()):
+                codex_publish.main(args)
+                codex_publish.main(args + ["--confirm-machine-id-sync"])
+            self.assertFalse((root / "shared" / "desktop" / "_archived_sessions").exists())
+
+    def test_publisher_rejects_active_archived_namespace_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            archived = root / "archived"
+            self.write_fixture(active / "_archived_sessions")
+            self.write_fixture(archived)
+            with self.assertRaisesRegex(ValueError, "namespace"):
+                publish_sessions(active, root / "shared", "desktop", archived_input=archived)
+            self.assertFalse((root / "shared").exists())
+
+    def test_publisher_rejects_conflicting_existing_archived_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            archived = root / "archived"
+            source = self.write_fixture(archived)
+            shared = root / "shared"
+            publish_sessions(active, shared, "desktop", archived_input=archived)
+            source.write_text(source.read_text().replace('"session-1"', '"different-id"'))
+            with self.assertRaisesRegex(ValueError, "different session"):
+                publish_sessions(active, shared, "desktop", archived_input=archived)
+            self.assertIn('"session-1"', (shared / "desktop" / "_archived_sessions" / source.name).read_text())
+
+    def test_shared_index_prefers_longer_archived_or_active_snapshot(self) -> None:
+        for longer_source in ("active", "archived"):
+            with self.subTest(longer_source=longer_source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                active = self.write_fixture(root / "active")
+                archived = self.write_fixture(root / "archived")
+                longer = active if longer_source == "active" else archived
+                longer.write_text(longer.read_text() + message("user", "Keep the full history."))
+                shared = root / "shared"
+                publish_sessions(active.parent, shared, "desktop", archived_input=archived.parent)
+                db = root / "index.sqlite"
+                index_sessions(shared, db)
+                index_sessions(shared, db)
+                with sqlite3.connect(db) as connection:
+                    texts = [row[0] for row in connection.execute("SELECT text FROM messages ORDER BY seq")]
+                self.assertIn("Keep the full history.", texts)
+
+    def test_new_stale_archived_copy_does_not_shorten_existing_shared_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = self.write_fixture(root / "active")
+            archived = self.write_fixture(root / "archived")
+            active.write_text(active.read_text() + message("user", "Previously indexed message."))
+            shared = root / "shared"
+            publish_sessions(active.parent, shared, "desktop")
+            db = root / "index.sqlite"
+            index_sessions(shared, db)
+            publish_sessions(active.parent, shared, "desktop", archived_input=archived.parent)
+            index_sessions(shared, db)
+            with sqlite3.connect(db) as connection:
+                texts = [row[0] for row in connection.execute("SELECT text FROM messages ORDER BY seq")]
+            self.assertIn("Previously indexed message.", texts)
+
+    def test_three_shared_copies_keep_longest_history_for_each_scan_order(self) -> None:
+        for archived_directory in ("0/_archived_sessions", "1/_archived_sessions", "2/_archived_sessions"):
+            with self.subTest(archived_directory=archived_directory), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                shared = root / "shared"
+                full = self.write_fixture(shared / "0", "active.jsonl")
+                short = self.write_fixture(shared / "2", "stale.jsonl")
+                archived = self.write_fixture(shared / archived_directory, "archived.jsonl")
+                full.write_text(full.read_text() + message("user", "Preserve the latest message."))
+                for path, seconds in ((full, 1), (archived, 2), (short, 3)):
+                    os.utime(path, ns=(seconds * 1_000_000_000,) * 2)
+                db = root / "index.sqlite"
+                index_sessions(shared, db)
+                index_sessions(shared, db)
+                with sqlite3.connect(db) as connection:
+                    texts = [row[0] for row in connection.execute("SELECT text FROM messages ORDER BY seq")]
+                self.assertIn("Preserve the latest message.", texts)
+
+    def test_archived_duplicate_accepts_a_changed_project_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared"
+            self.write_fixture(shared / "active")
+            archived = self.write_fixture(shared / "_archived_sessions")
+            archived.write_text(archived.read_text().replace("/personal/project", "/moved/project"))
+            db = root / "index.sqlite"
+            index_sessions(shared, db)
+            with sqlite3.connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 3)
+
+    def test_displaced_session_recovery_prefers_full_copy_over_newer_archived_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared"
+            winner = self.write_fixture(shared, "0-winner.jsonl")
+            full = self.write_fixture(shared, "1-full.jsonl")
+            archived = self.write_fixture(shared / "_archived_sessions")
+            for path in (winner, full):
+                path.write_text(path.read_text() + message("user", "Preserve recovery history."))
+            os.utime(full, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(winner, ns=(2_000_000_000, 2_000_000_000))
+            os.utime(archived, ns=(3_000_000_000, 3_000_000_000))
+            db = root / "index.sqlite"
+            index_sessions(shared, db)
+            winner.write_text(winner.read_text().replace('"session-1"', '"session-2"'))
+            index_sessions(shared, db)
+            with sqlite3.connect(db) as connection:
+                texts = [row[0] for row in connection.execute("SELECT text FROM messages WHERE session_id='session-1' ORDER BY seq")]
+            self.assertIn("Preserve recovery history.", texts)
+
+    def test_conflicting_archived_duplicate_preserves_existing_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = self.write_fixture(root / "active")
+            archived = self.write_fixture(root / "archived")
+            archived.write_text(archived.read_text().replace("browser-only", "conflicting"))
+            shared = root / "shared"
+            publish_sessions(active.parent, shared, "desktop", archived_input=archived.parent)
+            db = root / "index.sqlite"
+            index_sessions(active.parent, db)
+            with self.assertRaisesRegex(ValueError, "Conflicting archived"):
+                index_sessions(shared, db)
+            with sqlite3.connect(db) as connection:
+                self.assertIn("browser-only", " ".join(row[0] for row in connection.execute("SELECT text FROM messages")))
+
+    def test_publisher_preserves_existing_archived_history_on_shorter_or_conflicting_source(self) -> None:
+        for replacement in ("shorter", "conflicting"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                active = root / "active"
+                active.mkdir()
+                source = self.write_fixture(root / "archived", "session.jsonl.zst")
+                original = source.read_bytes() + message("user", "Keep this message.").encode()
+                source.write_bytes(zstandard.ZstdCompressor().compress(original))
+                shared = root / "shared"
+                publish_sessions(active, shared, "desktop", archived_input=source.parent)
+                destination = shared / "desktop" / "_archived_sessions" / source.name
+                saved = destination.read_bytes()
+                changed = original.splitlines(keepends=True)
+                if replacement == "shorter":
+                    changed = changed[:-1]
+                else:
+                    changed[-1] = changed[-1].replace(b"Keep this message", b"Different message")
+                source.write_bytes(zstandard.ZstdCompressor().compress(b"".join(changed)))
+                with self.assertRaisesRegex(ValueError, "replace existing history"):
+                    publish_sessions(active, shared, "desktop", archived_input=source.parent)
+                self.assertEqual(destination.read_bytes(), saved)
+                source.write_bytes(zstandard.ZstdCompressor().compress(original + message("user", "Added later.").encode()))
+                self.assertEqual(publish_sessions(active, shared, "desktop", archived_input=source.parent).copied, 1)
+
+    def test_publisher_validates_archived_snapshot_after_source_changes_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            source = self.write_fixture(root / "archived", "session.jsonl.zst")
+            original = source.read_bytes() + message("user", "Keep this message.").encode()
+            source.write_bytes(zstandard.ZstdCompressor().compress(original))
+            shared = root / "shared"
+            publish_sessions(active, shared, "desktop", archived_input=source.parent)
+            destination = shared / "desktop" / "_archived_sessions" / source.name
+            saved = destination.read_bytes()
+            source.write_bytes(zstandard.ZstdCompressor().compress(original + message("user", "New message.").encode()))
+            copyfile = codex_publish.shutil.copyfile
+
+            def truncate_before_copy(src: Path, dst: Path) -> None:
+                self.assertFalse(codex_publish.is_session_file(dst))
+                source.write_bytes(zstandard.ZstdCompressor().compress(original.splitlines(keepends=True)[0]))
+                copyfile(src, dst)
+
+            with patch.object(codex_publish.shutil, "copyfile", side_effect=truncate_before_copy):
+                with self.assertRaisesRegex(ValueError, "replace existing history"):
+                    publish_sessions(active, shared, "desktop", archived_input=source.parent)
+            self.assertEqual(destination.read_bytes(), saved)
+
+    def test_publisher_fails_for_missing_configured_archive_before_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            args = ["--machine-id", "desktop", "--archive-root", str(root / "shared")]
+            with patch.object(codex_publish, "default_input_path", return_value=str(active)), \
+                 patch.dict(os.environ, {"CODEX_SESSION_ARCHIVED_INPUT": str(root / "missing")}):
+                with self.assertRaises(FileNotFoundError):
+                    codex_publish.main(args)
+            self.assertFalse((root / "shared").exists())
+
     def test_plain_and_compressed_duplicates_use_newer_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
