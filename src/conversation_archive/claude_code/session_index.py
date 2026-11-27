@@ -10,6 +10,7 @@ import sqlite3
 from pathlib import Path
 
 from ..codex.session_index import SCHEMA_SQL, repair_session_fts
+from ..exclusions import excluded_session_ids, exclusions_digest, is_excluded, sql_condition
 
 VERSION = "2"
 # Increment when parser semantics require unchanged source files to be reparsed.
@@ -178,7 +179,8 @@ def parse_session_file(path: Path) -> dict | None:
         return None
     session_id = _session_stream_id(path, session_ids)
     title = title or next((m[2] for m in messages if m[0] == "user"), f"Claude Code session {session_id}")
-    return {"session_id": session_id, "cwd": cwd, "title": " ".join(title.split())[:140], "messages": messages}
+    return {"session_id": session_id, "cwd": cwd, "title": " ".join(title.split())[:140], "messages": messages,
+            "observed_ids": session_ids}
 
 
 def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True) -> tuple[int, int, int]:
@@ -219,6 +221,13 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
         repair_session_fts(connection)
         _invalidate_outdated_parser_cache(connection)
         connection.execute("PRAGMA foreign_keys=ON")
+        excluded_ids = excluded_session_ids()
+        digest = exclusions_digest(excluded_ids)
+        if connection.execute("SELECT value FROM index_meta WHERE key='excluded_sessions_digest'").fetchone() != (digest,):
+            # A fork file of a newly excluded session may be unchanged on disk.
+            incremental = False
+        with connection:
+            connection.execute(f"DELETE FROM sessions WHERE NOT ({sql_condition('session_id', excluded_ids)})")
         indexed = skipped = 0
         for path in files:
             if path.is_symlink() or (input_path.is_dir() and not path.resolve().is_relative_to(input_path)):
@@ -232,6 +241,11 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
             if session is None:
                 continue
             session_id, messages = session["session_id"], session["messages"]
+            # Fork files begin with their ancestors' events, so any listed ID excludes the file.
+            if any(is_excluded(candidate, excluded_ids) for candidate in [session_id, *session["observed_ids"]]):
+                with connection:
+                    connection.execute("DELETE FROM sessions WHERE source_path=?", (str(path),))
+                continue
             if not messages:
                 with connection:
                     connection.execute("DELETE FROM sessions WHERE source_path=?", (str(path),))
@@ -250,6 +264,8 @@ def index_sessions(input_path: Path, db_path: Path, *, incremental: bool = True)
                                        [(session_id, seq, *message, session["title"])
                                         for seq, message in enumerate(messages, 1)])
             indexed += 1
+        with connection:
+            connection.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('excluded_sessions_digest', ?)", (digest,))
         total = connection.execute("SELECT count(*) FROM messages").fetchone()[0]
         return indexed, skipped, total
     finally:
