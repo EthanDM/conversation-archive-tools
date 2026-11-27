@@ -20,6 +20,7 @@ from typing import Iterable, Iterator, Optional
 
 from .session_files import is_session_file, session_lines
 from .source_roots import ensure_scope_not_narrowed
+from ..exclusions import excluded_session_ids, exclusions_digest, sql_condition
 
 
 INDEXER_VERSION = "2"
@@ -188,7 +189,7 @@ def _title_from_messages(messages: list[RetainedMessage], session_id: str) -> st
     return title[:TITLE_LIMIT].rstrip()
 
 
-def parse_session_file(path: Path) -> Optional[ParsedSession]:
+def parse_session_file(path: Path, excluded_ids: frozenset[str] = frozenset()) -> Optional[ParsedSession]:
     """Parse one Codex JSONL file, skipping malformed records and excluded content.
 
     Excluded sessions and plain files without an ID return ``None``. Compressed
@@ -221,6 +222,11 @@ def parse_session_file(path: Path) -> Optional[ParsedSession]:
                         and isinstance(source.get("subagent"), dict)
                         and source["subagent"].get("other") == "guardian")
             if payload.get("thread_source") == "guardian_review" or guardian:
+                excluded = True
+                continue
+            # A subagent or fork carries its parent's text, so it shares the parent's exclusion.
+            related = (payload.get(key) for key in ("id", "session_id", "parent_thread_id", "forked_from_id"))
+            if any(isinstance(value, str) and value in excluded_ids for value in related):
                 excluded = True
                 continue
             candidate_id = payload.get("id")
@@ -416,11 +422,13 @@ def compare_archived_duplicate(cursor: sqlite3.Cursor, parsed: ParsedSession) ->
     return compare_session_history(existing, parsed)
 
 
-def parse_session_snapshot(path: Path) -> Optional[tuple[object, ParsedSession]]:
+def parse_session_snapshot(
+    path: Path, excluded_ids: frozenset[str] = frozenset()
+) -> Optional[tuple[object, ParsedSession]]:
     """Parse a stable session-file snapshot, retrying one concurrent replacement."""
     for _ in range(2):
         before = path.stat()
-        parsed = parse_session_file(path)
+        parsed = parse_session_file(path, excluded_ids)
         after = path.stat()
         if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
             return after, parsed
@@ -586,6 +594,12 @@ def _refresh_index(
         cursor.execute("DELETE FROM sessions")
         cursor.execute("DELETE FROM index_meta")
         incremental = False
+    excluded_ids = excluded_session_ids()
+    digest = exclusions_digest(excluded_ids)
+    if cursor.execute("SELECT value FROM index_meta WHERE key='excluded_sessions_digest'").fetchone() != (digest,):
+        # Unchanged files may hold a newly excluded session's subagents or forks.
+        incremental = False
+    cursor.execute(f"DELETE FROM sessions WHERE NOT ({sql_condition('session_id', excluded_ids)})")
     version = cursor.execute("SELECT value FROM index_meta WHERE key='indexer_version'").fetchone()
     if version != (INDEXER_VERSION,):
         if limit is not None and cursor.execute("SELECT count(*) FROM sessions").fetchone()[0]:
@@ -600,7 +614,7 @@ def _refresh_index(
     archived_session_ids = set()
     for path in paths:
         if "_archived_sessions" in path.parts:
-            parsed = parse_session_file(path)
+            parsed = parse_session_file(path, excluded_ids)
             if parsed is not None:
                 archived_session_ids.add(parsed.session_id)
 
@@ -614,7 +628,7 @@ def _refresh_index(
             if existing[1] == stat.st_size and existing[2] == stat.st_mtime_ns:
                 skipped += 1
                 continue
-        parsed = parse_session_file(path)
+        parsed = parse_session_file(path, excluded_ids)
         if parsed is None:
             original_path = source_path[:-4] if source_path.endswith(".jsonl.zst") else source_path + ".zst"
             if original_path in prior_paths and original_path not in source_paths:
@@ -663,7 +677,7 @@ def _refresh_index(
     if displaced_session_ids:
         displaced_candidates: dict[str, tuple[Path, object, ParsedSession]] = {}
         for path in paths:
-            snapshot = parse_session_snapshot(path)
+            snapshot = parse_session_snapshot(path, excluded_ids)
             if snapshot is None:
                 continue
             stat, parsed = snapshot
@@ -703,6 +717,8 @@ def _refresh_index(
                    (json.dumps([str(root) for root in (input_path, *additional_inputs)]),))
     cursor.execute("INSERT INTO index_meta(key,value) VALUES('source_root',?) "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(input_path),))
+    cursor.execute("INSERT INTO index_meta(key,value) VALUES('excluded_sessions_digest',?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (digest,))
     cursor.execute("INSERT INTO index_meta(key,value) VALUES('last_refresh_completed_at',?) "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                    (dt.datetime.now(dt.timezone.utc).isoformat(),))

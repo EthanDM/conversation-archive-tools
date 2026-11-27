@@ -13,6 +13,9 @@ from .chatgpt import paths as chatgpt_paths
 from .claude import paths as claude_paths
 from .codex import paths as codex_paths
 from .claude_code import paths as claude_code_paths
+from .exclusions import excluded_session_ids, is_excluded, sql_condition
+
+SESSION_PROVIDERS = {"codex", "claude_code"}
 
 PROVIDERS = {
     "chatgpt": chatgpt_paths.default_db_path,
@@ -77,6 +80,10 @@ def projection(provider: str, connection: sqlite3.Connection) -> str:
         {branch} AS is_sidechain,
         {"m.node_id" if provider == "chatgpt" else "NULL"} AS node_id,
         {"c.cwd" if provider in {"codex", "claude_code"} else "NULL"} AS cwd FROM messages m JOIN {table} c ON c.{key}=m.{foreign}"""
+    if provider in SESSION_PROVIDERS:
+        # Every read builds on this projection, so excluded sessions never reach a caller,
+        # even before the next refresh removes them from the index.
+        sql += " WHERE " + sql_condition("m.session_id", excluded_session_ids())
     connection.execute(sql + " LIMIT 0")
     connection.execute("SELECT rowid FROM messages_fts LIMIT 0")
     return sql
@@ -175,6 +182,8 @@ def search_within_conversation(provider: str, conversation_id: str, query: str, 
             table, identifier = "sessions", "session_id"
         exists = connection.execute(f"SELECT 1 FROM {table} WHERE {identifier}=? LIMIT 1",
                                     (conversation_id,)).fetchone() is not None
+        if provider in SESSION_PROVIDERS and is_excluded(conversation_id, excluded_session_ids()):
+            exists = False
         fields = ["message_index_id", "conversation_id", "seq", "role", "timestamp", "title",
                   "source", "message_id", "parent_id", "is_sidechain", "node_id", "cwd"]
         if include_text:
@@ -308,6 +317,8 @@ def list_conversations(provider: str, *, title: str = '', cwd: str | None = None
             FROM {table} c LEFT JOIN ({normalized}) n ON n.conversation_id=c.{key}
             WHERE coalesce(c.title, '') LIKE ? ESCAPE '\\'"""
         args = [literal_pattern(title)]
+        if provider in SESSION_PROVIDERS:
+            sql += " AND " + sql_condition("c.session_id", excluded_session_ids())
         if cwd is not None:
             sql += " AND c.cwd LIKE ? ESCAPE '\\'"
             args.append(literal_pattern(cwd))
