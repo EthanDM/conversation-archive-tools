@@ -107,6 +107,17 @@ class ExcludedSessionsTests(unittest.TestCase):
         index_codex(sessions, db)
         self.assertEqual(ids(), ["child", "fork", "hidden", "visible"])
 
+    def test_limited_codex_refresh_does_not_record_the_new_list(self) -> None:
+        sessions, db = self.root / "codex", self.root / "codex.sqlite"
+        codex_session(sessions / "a-hidden.jsonl", {"id": "hidden"}, "hiddenneedle")
+        codex_session(sessions / "b-fork.jsonl", {"id": "fork", "forked_from_id": "hidden"}, "forkneedle")
+        index_codex(sessions, db)
+        self.exclude("hidden")
+        index_codex(sessions, db, limit=1)
+        index_codex(sessions, db)
+        ids = sorted(row[0] for row in sqlite3.connect(db).execute("SELECT session_id FROM sessions"))
+        self.assertEqual(ids, [])
+
     def test_claude_code_refresh_drops_listed_sessions_forks_and_subagent_streams(self) -> None:
         projects, db = self.root / "projects", self.root / "claude_code.sqlite"
         claude_code_session(projects / "p" / "hidden.jsonl", ["hidden"], "hiddenneedle")

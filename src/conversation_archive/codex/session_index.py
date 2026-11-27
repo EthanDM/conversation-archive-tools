@@ -717,8 +717,10 @@ def _refresh_index(
                    (json.dumps([str(root) for root in (input_path, *additional_inputs)]),))
     cursor.execute("INSERT INTO index_meta(key,value) VALUES('source_root',?) "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(input_path),))
-    cursor.execute("INSERT INTO index_meta(key,value) VALUES('excluded_sessions_digest',?) "
-                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (digest,))
+    if limit is None:
+        # A limited run re-reads only some files, so it cannot vouch for the whole index.
+        cursor.execute("INSERT INTO index_meta(key,value) VALUES('excluded_sessions_digest',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (digest,))
     cursor.execute("INSERT INTO index_meta(key,value) VALUES('last_refresh_completed_at',?) "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                    (dt.datetime.now(dt.timezone.utc).isoformat(),))
